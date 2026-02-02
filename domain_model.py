@@ -23,6 +23,7 @@ class AxiTransaction:
         burst: Burst type (typically "seq" for sequential)
         hint: Optional hint field
         dep: List of dependencies in format "target_id,event+offset" (e.g., "10,req+100")
+        req_delay: Optional request delay in cycles (for line delay)
         deadline: Optional deadline field
     """
     id: int
@@ -33,13 +34,14 @@ class AxiTransaction:
     burst: str = "seq"
     hint: Optional[str] = None
     dep: List[str] = field(default_factory=list)
+    req_delay: Optional[int] = None
     deadline: Optional[int] = None
     
     def __str__(self) -> str:
         """
         Format transaction as a trace file line.
         
-        Format: id=1 port=DMA1 type=ReadNoSnoop address=0x80001000 bytes=64 burst=seq dep=1,req+10
+        Format: id=1 port=DMA1 type=ReadNoSnoop address=0x80001000 bytes=64 burst=seq req=100
         
         Returns:
             Formatted transaction string
@@ -57,6 +59,10 @@ class AxiTransaction:
         if self.hint:
             parts.append(f"hint={self.hint}")
         
+        # Add request delay if present (for line delay)
+        if self.req_delay is not None and self.req_delay > 0:
+            parts.append(f"req={self.req_delay}")
+        
         # Add dependencies if present (separated by |)
         if self.dep:
             dep_parts = [f"dep={dep}" for dep in self.dep]
@@ -73,9 +79,11 @@ class AxiTransaction:
         Add a dependency to this transaction.
         
         Args:
-            target_id: ID of the transaction this depends on
+            target_id: ID of the transaction this depends on (can be 0 for placeholder)
             event: Event type ("req" or "resp")
             offset: Cycle offset from the event (default 0)
         """
         dep_str = f"{target_id},{event}+{offset}"
         self.dep.append(dep_str)
+    
+

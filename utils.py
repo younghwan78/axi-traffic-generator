@@ -71,6 +71,59 @@ class MultimediaUtils:
         bpp = MultimediaUtils.calculate_bpp(color_format, bit_width)
         line_size = int(h_size * bpp)
         return line_size
+    
+    @staticmethod
+    def apply_compression(total_size: int, comp_ratio: float) -> int:
+        """
+        Apply compression ratio to total size.
+        
+        Args:
+            total_size: Original size in bytes
+            comp_ratio: Compression ratio (e.g., 0.5 for 50% compression)
+            
+        Returns:
+            Compressed size in bytes
+        """
+        return int(total_size * comp_ratio)
+    
+    @staticmethod
+    def align_width_for_compression(h_size: int, color_format: str) -> int:
+        """
+        Align width to compression requirements based on format.
+        
+        Args:
+            h_size: Horizontal pixel count
+            color_format: Color format type
+            
+        Returns:
+            Aligned horizontal size
+        """
+        format_upper = color_format.upper()
+        if "BAYER" in format_upper:
+            # Bayer: Align to 256 bytes
+            return ((h_size + 255) // 256) * 256
+        elif "YUV" in format_upper:
+            # YUV: Align to 32 bytes
+            return ((h_size + 31) // 32) * 32
+        return h_size
+    
+    @staticmethod
+    def align_height_for_compression(v_size: int, color_format: str) -> int:
+        """
+        Align height to compression requirements based on format.
+        
+        Args:
+            v_size: Vertical line count
+            color_format: Color format type
+            
+        Returns:
+            Aligned vertical size
+        """
+        format_upper = color_format.upper()
+        if "YUV" in format_upper:
+            # YUV: Align to 4 lines
+            return ((v_size + 3) // 4) * 4
+        return v_size
 
 
 class AddressAllocator:
@@ -86,9 +139,14 @@ class AddressAllocator:
             base_address: Starting base address (default 0x80000000)
             alignment: Address alignment in bytes (default 4KB = 4096)
         """
-        self.base_address = base_address
         self.alignment = alignment
-        self.current_address = base_address
+        # Ensure base_address is aligned (important for ion allocation in Android-based Linux OS)
+        remainder = base_address % alignment
+        if remainder != 0:
+            self.base_address = base_address + (alignment - remainder)
+        else:
+            self.base_address = base_address
+        self.current_address = self.base_address
         self.allocations: Dict[str, tuple] = {}  # ip_name -> (start, size)
     
     def allocate(self, size: int, ip_name: str = "") -> int:

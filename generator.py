@@ -95,7 +95,8 @@ class StreamGenerator:
     @staticmethod
     def generate_stream(port: str, tx_type: str, start_addr: int, 
                        total_size: int, burst_size: int = 64,
-                       line_size: int = 0, h_size: int = 0, bpp: float = 0) -> Stream:
+                       line_size: int = 0, h_size: int = 0, bpp: float = 0,
+                       llc_enable: bool = False, line_delay: int = 0) -> Stream:
         """
         Generate a stream of AXI transactions.
         
@@ -108,6 +109,8 @@ class StreamGenerator:
             line_size: Size of one line in bytes (for OTF sync)
             h_size: Horizontal pixel count
             bpp: Bytes per pixel
+            llc_enable: Enable LLC allocation hint (default False)
+            line_delay: Initial line delay in cycles (default 0)
             
         Returns:
             Stream object containing transactions
@@ -127,8 +130,13 @@ class StreamGenerator:
                 type=tx_type,
                 address=current_addr,
                 bytes=transfer_size,
-                burst="seq"
+                burst="seq",
+                hint="LLC_ALLOC" if llc_enable else None
             )
+            
+            # Apply line delay to first transaction
+            if len(transactions) == 0 and line_delay > 0:
+                tx.req_delay = line_delay
             
             transactions.append(tx)
             

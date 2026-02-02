@@ -34,7 +34,11 @@ class AxiTrafficGenerator:
     # Optional IP config fields with defaults
     OPTIONAL_IP_FIELDS = {
         'R/W Rate': '1.0',
-        'Outstanding': '16'
+        'Outstanding': '16',
+        'Comp Mode': 'Disable',
+        'Comp Ratio': '',
+        'LLC Enable': 'Disable',
+        'Line Delay': '0'
     }
     
     # Legacy: Optional dependency fields (for backward compatibility)
@@ -108,10 +112,29 @@ class AxiTrafficGenerator:
             color_format = job['Color Format']
             bit_width = int(job['Bit Width'])
             
+            # Check compression settings
+            comp_mode = job.get('Comp Mode', 'Disable').strip()
+            comp_enabled = comp_mode.lower() == 'enable'
+            
+            # Apply alignment if compression enabled
+            if comp_enabled:
+                h_size = self.utils.align_width_for_compression(h_size, color_format)
+                v_size = self.utils.align_height_for_compression(v_size, color_format)
+            
             # Calculate sizes
             total_size = self.utils.calculate_total_size(h_size, v_size, color_format, bit_width)
+            
+            # Apply compression ratio if enabled
+            if comp_enabled and job.get('Comp Ratio'):
+                comp_ratio = float(job['Comp Ratio'])
+                total_size = self.utils.apply_compression(total_size, comp_ratio)
+            
             line_size = self.utils.calculate_line_size(h_size, color_format, bit_width)
             bpp = self.utils.calculate_bpp(color_format, bit_width)
+            
+            # Get LLC and line delay settings
+            llc_enable = job.get('LLC Enable', 'Disable').strip().lower() == 'enable'
+            line_delay = int(job.get('Line Delay', '0'))
             
             # Allocate memory address
             start_addr = self.allocator.allocate(total_size, ip_name)
@@ -119,7 +142,7 @@ class AxiTrafficGenerator:
             # Determine transaction type
             tx_type = "ReadNoSnoop" if in_out.lower() == "in" else "WriteNoSnoop"
             
-            # Generate stream
+            # Generate stream with LLC and line delay support
             stream = self.generator.generate_stream(
                 port=ip_name,
                 tx_type=tx_type,
@@ -128,14 +151,18 @@ class AxiTrafficGenerator:
                 burst_size=64,
                 line_size=line_size,
                 h_size=h_size,
-                bpp=bpp
+                bpp=bpp,
+                llc_enable=llc_enable,
+                line_delay=line_delay
             )
             
-            # Store stream with job metadata (including GroupName for future group-based dependencies)
+            # Store stream with job metadata (including GroupName for group-based dependencies)
             self.streams[ip_name] = {
                 'stream': stream,
                 'job': job,
-                'group': group_name  # Store group for easy access
+                'group': group_name,
+                'llc_enable': llc_enable,
+                'line_delay': line_delay
             }
     
     def apply_intra_dependencies(self) -> None:
@@ -174,20 +201,41 @@ class AxiTrafficGenerator:
             for row_num, row in enumerate(reader, start=2):
                 normalized_row = {k.strip(): v.strip() if v else '' for k, v in row.items()}
                 
-                # Required: Consumer, Producer, Sync Type
-                required = ['Consumer', 'Producer', 'Sync Type']
-                missing = [f for f in required if f not in normalized_row or not normalized_row[f]]
-                
-                if missing:
-                    print(f"Warning: Dependency row {row_num} missing: {missing}")
-                    continue
-                
-                dep = {
-                    'Consumer': normalized_row['Consumer'],
-                    'Producer': normalized_row['Producer'],
-                    'Sync Type': normalized_row['Sync Type'],
-                    'Delay': int(normalized_row.get('Delay', '0'))
-                }
+                # Support both old (DMA-based) and new (Group-based) formats
+                # New format: 'Consumer Group', 'Producer Group'
+                # Old format: 'Consumer', 'Producer'
+                if 'Consumer Group' in normalized_row and 'Producer Group' in normalized_row:
+                    # New group-based format
+                    required = ['Consumer Group', 'Producer Group', 'Sync Type']
+                    missing = [f for f in required if f not in normalized_row or not normalized_row[f]]
+                    
+                    if missing:
+                        print(f"Warning: Dependency row {row_num} missing: {missing}")
+                        continue
+                    
+                    dep = {
+                        'Consumer': normalized_row['Consumer Group'],
+                        'Producer': normalized_row['Producer Group'],
+                        'Sync Type': normalized_row['Sync Type'],
+                        'Delay': int(normalized_row.get('Delay', '0')),
+                        'IsGroupBased': True
+                    }
+                else:
+                    # Legacy DMA-based format
+                    required = ['Consumer', 'Producer', 'Sync Type']
+                    missing = [f for f in required if f not in normalized_row or not normalized_row[f]]
+                    
+                    if missing:
+                        print(f"Warning: Dependency row {row_num} missing: {missing}")
+                        continue
+                    
+                    dep = {
+                        'Consumer': normalized_row['Consumer'],
+                        'Producer': normalized_row['Producer'],
+                        'Sync Type': normalized_row['Sync Type'],
+                        'Delay': int(normalized_row.get('Delay', '0')),
+                        'IsGroupBased': False
+                    }
                 
                 dependencies.append(dep)
         
@@ -207,22 +255,45 @@ class AxiTrafficGenerator:
                 producer = dep['Producer']
                 sync_type = dep['Sync Type']
                 delay = dep['Delay']
+                is_group_based = dep.get('IsGroupBased', False)
                 
-                if consumer not in self.streams:
-                    print(f"Warning: Consumer '{consumer}' not found")
-                    continue
-                
-                if producer not in self.streams:
-                    print(f"Warning: Producer '{producer}' not found")
-                    continue
-                
-                consumer_stream = self.streams[consumer]['stream']
-                producer_stream = self.streams[producer]['stream']
-                
-                if sync_type.upper() == 'M2M':
-                    self.dep_manager.apply_m2m_sync(producer_stream, consumer_stream, delay)
-                elif sync_type.upper() == 'OTF':
-                    self.dep_manager.apply_otf_sync(producer_stream, consumer_stream, delay)
+                if is_group_based:
+                    # Group-based dependencies
+                    # Find all streams belonging to consumer and producer groups
+                    consumer_streams = [data['stream'] for ip, data in self.streams.items() 
+                                      if data['group'] == consumer]
+                    producer_streams = [data['stream'] for ip, data in self.streams.items() 
+                                      if data['group'] == producer]
+                    
+                    if not consumer_streams:
+                        print(f"Warning: No DMAs found for consumer group '{consumer}'")
+                        continue
+                    
+                    if not producer_streams:
+                        print(f"Warning: No DMAs found for producer group '{producer}'")
+                        continue
+                    
+                    if sync_type.upper() == 'M2M':
+                        self.dep_manager.apply_m2m_group_sync(producer_streams, consumer_streams, delay)
+                    elif sync_type.upper() == 'OTF':
+                        self.dep_manager.apply_otf_group_sync(producer_streams, consumer_streams)
+                else:
+                    # Legacy DMA-based dependencies
+                    if consumer not in self.streams:
+                        print(f"Warning: Consumer '{consumer}' not found")
+                        continue
+                    
+                    if producer not in self.streams:
+                        print(f"Warning: Producer '{producer}' not found")
+                        continue
+                    
+                    consumer_stream = self.streams[consumer]['stream']
+                    producer_stream = self.streams[producer]['stream']
+                    
+                    if sync_type.upper() == 'M2M':
+                        self.dep_manager.apply_m2m_sync(producer_stream, consumer_stream, delay)
+                    elif sync_type.upper() == 'OTF':
+                        self.dep_manager.apply_otf_sync(producer_stream, consumer_stream, delay)
         
         # Otherwise, use inline dependency fields (backward compatibility)
         else:

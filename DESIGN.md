@@ -157,7 +157,9 @@ class AxiTransaction:
     address: int               # Memory address (hex)
     bytes: int                 # Transfer size (64)
     burst: str = "seq"         # Burst type
+    hint: Optional[str] = None # Cache hint (e.g., "LLC_ALLOC")
     dep: List[str] = []        # ["target_id,event+offset", ...]
+    req_delay: Optional[int] = None  # Line delay in cycles
     
     def add_dependency(target_id, event, offset):
         # Adds formatted dependency string
@@ -182,13 +184,27 @@ class MultimediaUtils:
         # Bayer: bit_width / 8
         # YUV: 1.5 * bit_width / 8
         # RGB: 3 * bit_width / 8
+    
+    @staticmethod
+    def apply_compression(total_size: int, comp_ratio: float) -> int:
+        # Reduces size by compression ratio
+    
+    @staticmethod
+    def align_width_for_compression(h_size: int, color_format: str) -> int:
+        # Bayer: Align to 256 bytes
+        # YUV: Align to 32 bytes
+    
+    @staticmethod
+    def align_height_for_compression(v_size: int, color_format: str) -> int:
+        # YUV: Align to 4 lines
 ```
 
 #### AddressAllocator
 ```python
 class AddressAllocator:
     def __init__(self, base=0x80000000):
-        self._current = base
+        # Align base address to 4KB (ion allocation requirement)
+        self._current = ((base + 0xFFF) // 0x1000) * 0x1000
     
     def allocate(self, size_bytes: int) -> int:
         # Returns 4KB-aligned address
@@ -215,23 +231,30 @@ class Stream:
 #### StreamGenerator
 ```python
 class StreamGenerator:
-    def generate(ip_name, start_addr, total_bytes, tx_type):
+    def generate_stream(port, tx_type, start_addr, total_size, 
+                       burst_size=64, llc_enable=False, line_delay=0):
         BURST_SIZE = 64
-        num_bursts = ceil(total_bytes / BURST_SIZE)
+        num_bursts = ceil(total_size / BURST_SIZE)
         
         transactions = []
         for i in range(num_bursts):
             addr = start_addr + (i * BURST_SIZE)
             tx = AxiTransaction(
                 id=0,  # Assigned later
-                port=ip_name,
+                port=port,
                 type=tx_type,
                 address=addr,
-                bytes=min(BURST_SIZE, remaining)
+                bytes=min(BURST_SIZE, remaining),
+                hint="LLC_ALLOC" if llc_enable else None
             )
+            
+            # Apply line delay to first transaction
+            if i == 0 and line_delay > 0:
+                tx.req_delay = line_delay
+            
             transactions.append(tx)
         
-        return Stream(ip_name, transactions)
+        return Stream(port, transactions)
 ```
 
 **Key Decisions**:
@@ -263,13 +286,14 @@ def apply_rate_limiting(stream, rate):
 
 def apply_outstanding_limit(stream, outstanding):
     """
-    TX[i] depends on TX[i-outstanding] response
+    TX[i] depends on TX[i-outstanding] request
     
     Ensures max 'outstanding' transactions in flight
+    Note: Uses 'req' instead of 'resp' as there's no deadline mechanism
     """
     for i, tx in enumerate(stream.transactions[outstanding:], outstanding):
         target_tx = stream.transactions[i - outstanding]
-        tx.add_dependency(target_tx.id, "resp", 0)
+        tx.add_dependency(target_tx.id, "req", 0)
 ```
 
 **Inter-IP Methods**:
@@ -278,11 +302,11 @@ def apply_m2m_sync(producer_stream, consumer_stream, delay):
     """
     Frame-level sync: Consumer waits for producer's last TX
     
-    consumer.transactions[0].dep = producer.transactions[-1],resp+delay
+    consumer.transactions[0].dep = producer.transactions[-1],req+delay
     """
     last_producer = producer_stream.transactions[-1]
     first_consumer = consumer_stream.transactions[0]
-    first_consumer.add_dependency(last_producer.id, "resp", delay)
+    first_consumer.add_dependency(last_producer.id, "req", delay)
 
 def apply_otf_sync(producer_stream, consumer_stream, delay):
     """
@@ -295,6 +319,20 @@ def apply_otf_sync(producer_stream, consumer_stream, delay):
         consumer_line_start = k * bursts_per_line
         producer_line_start = k * bursts_per_line
         consumer[consumer_line_start].dep = producer[producer_line_start],req+delay
+    """
+
+def apply_m2m_group_sync(producer_streams, consumer_streams, delay):
+    """
+    Group-based M2M: All consumer DMAs wait for last-completing producer DMA
+    
+    Finds last TX across all producer streams, makes all consumer first TXs depend on it
+    """
+    
+def apply_otf_group_sync(producer_streams, consumer_streams):
+    """
+    Group-based OTF: Line-level sync between groups
+    
+    Line delay handled by req_delay attribute, not inter-IP dependencies
     """
 ```
 
@@ -350,6 +388,17 @@ Inter-IP Dependencies (M2M, OTF)
        ↓
    Export Trace
 ```
+
+**Execution- ✅ Flexible Configuration**: Separate IP and dependency configuration files
+- ✅ **Multiple Sync Types**: M2M (frame-level) and OTF (line-level) synchronization
+- ✅ **Compression Support**: Format-specific alignment with configurable ratios
+- ✅ **LLC Allocation Hints**: Last Level Cache optimization support
+- ✅ **Line Delay**: Configurable timing delays for stream synchronization
+- ✅ **Group-Based Dependencies**: Simplified dependency management
+- ✅ **Intra-IP Dependencies**: Rate limiting and outstanding buffer control
+- ✅ **Inter-IP Dependencies**: Chain and pipeline dependency support
+- ✅ **Automatic Analysis**: Built-in dependency summary with visual graph
+- ✅ **Standard Libraries Only**: No external dependencies requirednce transaction IDs. Without IDs, `dep=0,resp+0` occurs.
 
 **Why ID Assignment First?**  
 Dependencies reference transaction IDs. Without IDs, `dep=0,resp+0` occurs.
@@ -428,14 +477,21 @@ can_issue = (
 
 ### Dependency Examples
 
+**Line Delay**:
+```
+TX 1: req=100         # First transaction delayed by 100 cycles
+TX 2: (no req delay)
+...
+```
+
 **Outstanding Limit (8)**:
 ```
 TX 1: (no dep)
 TX 2: (no dep)
 ...
 TX 8: (no dep)
-TX 9: dep=1,resp+0     # Wait for TX 1 response
-TX 10: dep=2,resp+0    # Wait for TX 2 response
+TX 9: dep=1,req+0     # Wait for TX 1 request
+TX 10: dep=2,req+0    # Wait for TX 2 request
 ```
 
 **Rate Limiting (rate=0.5)**:
@@ -447,9 +503,16 @@ TX 3: dep=2,req+128
 
 **M2M Sync**:
 ```
-# GPU_WR last TX: id=117864
+# GPU_WR last TX: id=128124
 # DISP_RD first TX: 
-dep=117864,resp+0      # Wait for GPU_WR frame completion
+dep=128124,req+200     # Wait for GPU_WR frame + 200 cycles
+```
+
+**LLC Hint**:
+```
+# ISP_FE with LLC enabled:
+id=21601 port=ISP_FE type=ReadNoSnoop address=0x80152000 bytes=64 
+         burst=seq hint=LLC_ALLOC
 ```
 
 **OTF Sync** (line 0, assuming 30 bursts/line):

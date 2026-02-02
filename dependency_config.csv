@@ -1,3 +1,3 @@
-Consumer,Producer,Sync Type,Delay
-ISP_FE,CAM_FE,OTF,100
-DISP_RD,GPU_WR,M2M,0
+Consumer Group,Producer Group,Sync Type,Delay
+INTCAM,CAM,OTF,0
+DPU,GPU,M2M,200
