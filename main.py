@@ -403,33 +403,126 @@ class AxiTrafficGenerator:
         print(f"  - Summary: {summary_path}")
 
 
+def run_yaml_mode(ip_spec_path: str, scenario_path: str,
+                   output_path: str = "trace.txt") -> None:
+    """
+    YAML-based pipeline: ConfigParser → Scheduler → Trace output.
+
+    Args:
+        ip_spec_path: Path to DMA_IP_Spec.yaml
+        scenario_path: Path to Scenario.yaml
+        output_path: Output trace file path
+    """
+    from config_parser import ConfigParser
+    from smmu_model import MockSMMU
+    from scheduler import build_scheduler
+
+    print(f"Loading IP spec: {ip_spec_path}")
+    specs = ConfigParser.load_ip_spec(ip_spec_path)
+    print(f"  Found {len(specs)} IP definitions")
+
+    print(f"Loading scenario: {scenario_path}")
+    scenario = ConfigParser.load_scenario(scenario_path)
+    print(f"  Scenario: {scenario.name}")
+    print(f"  Tasks: {len(scenario.tasks)}")
+
+    # Sanity check
+    print("\nRunning sanity check...")
+    errors = ConfigParser.sanity_check(specs, scenario)
+    if errors:
+        print("✗ Sanity check FAILED:")
+        for err in errors:
+            print(f"  - {err}")
+        sys.exit(1)
+    print("✓ Sanity check passed")
+
+    # SMMU
+    smmu = None
+    if scenario.memory_policy.smmu_enable:
+        print(f"\nSMMU enabled (CMA ratio: {scenario.memory_policy.cma_ratio})")
+        smmu = MockSMMU(
+            cma_ratio=scenario.memory_policy.cma_ratio,
+            page_size=scenario.memory_policy.page_size,
+            enabled=True,
+        )
+
+    # Build and run scheduler
+    print("\nBuilding scheduler...")
+    scheduler = build_scheduler(specs, scenario, smmu)
+    print(f"  Registered {len(scheduler.agents)} agents")
+
+    print("Running simulation...")
+    all_transactions = scheduler.run()
+    print(f"  Generated {len(all_transactions)} transactions in {scheduler.tick + 1} ticks")
+
+    # Assign sequential IDs
+    for idx, tx in enumerate(all_transactions, start=1):
+        tx.id = idx
+
+    # Export
+    print(f"\nExporting to {output_path}...")
+    with open(output_path, 'w', encoding='utf-8') as f:
+        for tx in all_transactions:
+            f.write(str(tx) + '\n')
+
+    print(f"\n✓ AXI Traffic Generation Complete! ({len(all_transactions)} transactions)")
+    print(f"  Trace: {output_path}")
+
+    # Generate summary report
+    summary_path = output_path.replace('.txt', '_summary.txt')
+    print(f"\nGenerating summary report...")
+    generate_summary(output_path, summary_path)
+    print(f"  Summary: {summary_path}")
+
+
 def main():
-    """Entry point."""
+    """Entry point supporting both YAML and legacy CSV modes."""
+
+    # YAML mode: python main.py --yaml DMA_IP_Spec.yaml Scenario.yaml [output.txt]
+    if len(sys.argv) >= 2 and sys.argv[1] == "--yaml":
+        if len(sys.argv) < 4:
+            print("Usage (YAML mode):")
+            print("  python main.py --yaml <DMA_IP_Spec.yaml> <Scenario.yaml> [output.txt]")
+            sys.exit(1)
+
+        ip_spec_path = sys.argv[2]
+        scenario_path = sys.argv[3]
+        output_path = sys.argv[4] if len(sys.argv) > 4 else "trace.txt"
+
+        for p in [ip_spec_path, scenario_path]:
+            if not Path(p).exists():
+                print(f"Error: File not found: {p}")
+                sys.exit(1)
+
+        run_yaml_mode(ip_spec_path, scenario_path, output_path)
+        return
+
+    # Legacy CSV mode
     if len(sys.argv) < 2:
         print("Usage:")
+        print("  python main.py --yaml <DMA_IP_Spec.yaml> <Scenario.yaml> [output.txt]")
         print("  python main.py <ip_config.csv> [output.txt] [dependency.csv]")
         print("\nExamples:")
+        print("  python main.py --yaml DMA_IP_Spec.yaml Scenario_4K.yaml trace.txt")
         print("  python main.py ip_config.csv trace.txt dependency_config.csv")
-        print("  python main.py test_scenario.csv trace.txt  # Legacy format")
         sys.exit(1)
-    
+
     ip_csv = sys.argv[1]
     output_path = sys.argv[2] if len(sys.argv) > 2 else "trace.txt"
     dep_csv = sys.argv[3] if len(sys.argv) > 3 else None
-    
-    # Check if CSV exists
+
     if not Path(ip_csv).exists():
         print(f"Error: IP config file not found: {ip_csv}")
         sys.exit(1)
-    
+
     if dep_csv and not Path(dep_csv).exists():
         print(f"Error: Dependency config file not found: {dep_csv}")
         sys.exit(1)
-    
-    # Run generator
+
     generator = AxiTrafficGenerator()
     generator.run(ip_csv, output_path, dep_csv)
 
 
 if __name__ == "__main__":
     main()
+

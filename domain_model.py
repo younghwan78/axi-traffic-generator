@@ -25,6 +25,10 @@ class AxiTransaction:
         dep: List of dependencies in format "target_id,event+offset" (e.g., "10,req+100")
         req_delay: Optional request delay in cycles (for line delay)
         deadline: Optional deadline field
+        tick: Virtual Tick assigned by scheduler
+        plane: Plane index (0=Y, 1=UV)
+        rw: Internal R/W flag ("R" or "W")
+        iova: Pre-SMMU virtual address (for debugging)
     """
     id: int
     port: str
@@ -36,24 +40,35 @@ class AxiTransaction:
     dep: List[str] = field(default_factory=list)
     req_delay: Optional[int] = None
     deadline: Optional[int] = None
+    tick: Optional[int] = None
+    plane: int = 0
+    rw: str = "W"
+    iova: Optional[int] = None
     
     def __str__(self) -> str:
         """
         Format transaction as a trace file line.
         
-        Format: id=1 port=DMA1 type=ReadNoSnoop address=0x80001000 bytes=64 burst=seq req=100
+        With tick:  tick=100 id=1 port=DMA1 type=ReadNoSnoop address=0x80001000 bytes=64 burst=seq
+        Without:    id=1 port=DMA1 type=ReadNoSnoop address=0x80001000 bytes=64 burst=seq
         
         Returns:
             Formatted transaction string
         """
-        parts = [
+        parts = []
+        
+        # Prepend tick if available (scheduler mode)
+        if self.tick is not None:
+            parts.append(f"tick={self.tick}")
+        
+        parts.extend([
             f"id={self.id}",
             f"port={self.port}",
             f"type={self.type}",
             f"address={self.address:#x}",  # Format as 0x...
             f"bytes={self.bytes}",
             f"burst={self.burst}"
-        ]
+        ])
         
         # Add optional hint
         if self.hint:

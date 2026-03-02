@@ -1,0 +1,66 @@
+# Dynamic Scenario Configuration
+# 동적 유스케이스 정의 파일 - Clock, 해상도, Dependency, Behavior 등
+
+Scenario_Info:
+  Name: "4K_Camera_to_Display"
+
+Clock_Domains:
+  MM: 800       # MHz
+  UD: 533       # MHz
+
+Memory_Policy:
+  SMMU_Enable: false    # SMMU 활성화 여부 (default: false)
+  CMA_Ratio: 0.3        # 30%는 연속된 물리 메모리 할당
+  Page_Size: 4096        # 4KB
+
+Tasks:
+  - TaskName: "ISP_Write"
+    IP_Name: "CAM_ISP_WR_0"
+    Clock: "MM"
+    Format: "YUV420_8bit_2plane"
+    Resolution: [3840, 2160]
+    AccessType: "raster-order"
+    Dependency: []
+    Behavior_Profile:
+      Type: "Eager_MO_Burst"
+      Pipeline_Group: "CAM_FE_PIPE"
+
+  - TaskName: "ISP_Read"
+    IP_Name: "CAM_ISP_RD_0"
+    Clock: "MM"
+    Format: "YUV420_8bit_2plane"
+    Resolution: [3840, 2160]
+    AccessType: "raster-order"
+    Dependency: []
+    Behavior_Profile:
+      Type: "Eager_MO_Burst"
+      Pipeline_Group: "CAM_FE_PIPE"
+      Backpressure_Source: "ISP_Write"
+
+  - TaskName: "CAM_AE_Stat"
+    IP_Name: "CAM_STAT_WR_0"
+    Clock: "MM"
+    Format: "RAW"
+    Resolution: [3840, 2160]
+    AccessType: "raster-order"
+    Dependency: []
+    Behavior_Profile:
+      Type: "Accumulate_and_Flush"
+      Trigger_Unit: "Block"
+      Block_Size: [64, 64]
+      Flush_Bytes: 256
+      Pipeline_Group: "CAM_FE_PIPE"
+
+  - TaskName: "DISP_Read"
+    IP_Name: "DISP_RD_0"
+    Clock: "UD"
+    Format: "YUV420_8bit_2plane"
+    Resolution: [3840, 2160]
+    AccessType: "raster-order"
+    Dependency:
+      - Wait_For: "ISP_Write"
+        Granularity: "Line"
+        Margin: 10
+    Behavior_Profile:
+      Type: "Eager_MO_Burst"
+      Pipeline_Group: "DPU_PIPE"

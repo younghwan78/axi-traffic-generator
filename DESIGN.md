@@ -1,672 +1,475 @@
-# AXI Traffic Generator - Design Documentation
+# AXI Traffic Generator — Design Documentation
 
 ## Table of Contents
 - [Architecture Overview](#architecture-overview)
-- [Data Flow](#data-flow)
 - [Module Details](#module-details)
+- [Data Flow](#data-flow)
+- [Key Algorithms](#key-algorithms)
 - [Dependency System](#dependency-system)
-- [Extension Points](#extension-points)
+- [Appendix: Legacy CSV Mode](#appendix-legacy-csv-mode)
 
 ---
 
 ## Architecture Overview
 
-### Design Philosophy
-
-The AXI Traffic Generator follows a **modular, pipeline-based architecture** with clear separation of concerns:
-
-1. **Configuration Layer**: CSV-based declarative configuration
-2. **Generation Layer**: Transaction stream creation
-3. **Dependency Layer**: Constraint application
-4. **Export Layer**: Trace file output
-5. **Analysis Layer**: Summary and visualization
-
 ```
-┌─────────────────────────────────────────────────────────┐
-│              Configuration (CSV Files)                   │
-│  ┌──────────────────┐    ┌──────────────────────┐      │
-│  │  ip_config.csv   │    │ dependency_config.csv│      │
-│  └──────────────────┘    └──────────────────────┘      │
-└─────────────────┬──────────────────┬──────────────────┘
-                  │                  │
-                  ▼                  ▼
-         ┌────────────────┐  ┌──────────────────┐
-         │ IP Generator   │  │ Dependency Rules │
-         └────────┬───────┘  └─────────┬────────┘
-                  │                    │
-                  ▼                    ▼
-         ┌──────────────────────────────────────┐
-         │      Transaction Streams             │
-         │  (AxiTransaction objects)            │
-         └─────────┬────────────────────────────┘
-                   │
-                   ▼
-         ┌──────────────────────────────────────┐
-         │    Dependency Application            │
-         │  - Intra-IP (rate, outstanding)      │
-         │  - Inter-IP (M2M, OTF)               │
-         └─────────┬────────────────────────────┘
-                   │
-                   ├─────────────┬────────────────┐
-                   ▼             ▼                ▼
-         ┌──────────────┐  ┌─────────┐  ┌─────────────┐
-         │  trace.txt   │  │ summary │  │   metrics   │
-         └──────────────┘  └─────────┘  └─────────────┘
-```
-
----
-
-## Data Flow
-
-### 1. Configuration Parsing
-
-**Input**: CSV files  
-**Output**: Job dictionaries with normalized fields
-
-```python
-# main.py: load_ip_config()
-ip_config.csv → CSV Parser → [
-    {
-        'IP': 'CAM_FE',
-        'GroupName': 'CAM',
-        'In/Out': 'Out',
-        'H size': 1920,
-        'V size': 1080,
-        'Color Format': 'Bayer',
-        'Bit Width': 10,
-        'R/W Rate': 1.0,
-        'Outstanding': 8
-    },
-    ...
-]
-```
-
-### 2. Stream Generation
-
-**Input**: Job configurations  
-**Output**: Transaction streams
-
-```python
-# generator.py: StreamGenerator.generate()
-For each job:
-    1. Calculate total_size = H × V × BPP
-    2. Allocate base address (4KB aligned)
-    3. Split into 64-byte bursts
-    4. Create AxiTransaction objects
-    
-Result: Stream(ip_name, [tx1, tx2, ..., txN])
-```
-
-### 3. ID Assignment
-
-**Input**: Multiple streams  
-**Output**: Globally numbered transactions
-
-```python
-# main.py: assign_transaction_ids()
-Collect all transactions from all streams
-Sort by (optional criteria)
-Assign sequential IDs: 1, 2, 3, ..., N
-```
-
-### 4. Dependency Application
-
-**Input**: Streams with IDs  
-**Output**: Transactions with dependency links
-
-```python
-# dependency.py: DependencyManager
-Intra-IP:
-    - apply_rate_limiting() → dep=N-1,req+offset
-    - apply_outstanding_limit() → dep=N-k,resp+0
-    
-Inter-IP:
-    - apply_m2m_sync() → dep=producer_last,resp+0
-    - apply_otf_sync() → dep=producer_line_k,req+offset
-```
-
-### 5. Export & Analysis
-
-**Input**: Final transaction list  
-**Output**: Trace file + Summary
-
-```python
-# main.py: export_trace()
-Write each transaction in format:
-    id=X port=P type=T address=A bytes=B burst=seq dep=...
-
-# gen_summary.py: generate_summary()
-Analyze trace → Generate summary with graph
+┌──────────────────────────────────────────────────────────────┐
+│                     Configuration Layer                       │
+│  ┌──────────────────┐    ┌──────────────────────┐            │
+│  │ DMA_IP_Spec.yaml │    │    Scenario.yaml      │            │
+│  └────────┬─────────┘    └──────────┬───────────┘            │
+│           └────────────┬────────────┘                        │
+│                ┌───────┴───────┐                             │
+│                │ ConfigParser  │  ← Sanity Check             │
+│                └───────┬───────┘                             │
+├──────────────────────────────────────────────────────────────┤
+│                     Model Layer                               │
+│  ┌──────────────────┐  ┌──────────────────┐                  │
+│  │ FormatDescriptor │  │  AxiTransaction   │                  │
+│  │ (PlaneInfo, BPP) │  │ (tick,plane,rw,..)│                  │
+│  └────────┬─────────┘  └──────────────────┘                  │
+├──────────────────────────────────────────────────────────────┤
+│                     Generation Layer                          │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │                   StreamGenerator                      │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌────────────┐   │  │
+│  │  │ 64B Chopper  │  │ RasterOrder  │  │  Z-Order   │   │  │
+│  │  └──────────────┘  │   Pattern    │  │  Pattern   │   │  │
+│  │                    └──────────────┘  └────────────┘   │  │
+│  └────────────────────────────┬───────────────────────────┘  │
+├──────────────────────────────────────────────────────────────┤
+│                     Scheduling Layer                          │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │              VirtualTickScheduler                     │    │
+│  │  ┌────────────┐  ┌────────────┐  ┌──────────────┐   │    │
+│  │  │  DmaAgent  │  │ Scoreboard │  │  MockSMMU    │   │    │
+│  │  │  +Strategy │  │ (deps,     │  │ (IOVA→PA,    │   │    │
+│  │  │  (per task)│  │  progress) │  │  PTW inject) │   │    │
+│  │  └────────────┘  └────────────┘  └──────────────┘   │    │
+│  └────────────────────────────┬──────────────────────────┘   │
+├──────────────────────────────────────────────────────────────┤
+│                     Output Layer                              │
+│  ┌────────────────┐  ┌──────────────────────┐                │
+│  │   trace.txt    │  │  trace_summary.txt   │                │
+│  │  (tick-based)  │  │ (BW, addr, behavior) │                │
+│  └────────────────┘  └──────────────────────┘                │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
 ## Module Details
 
-### 1. domain_model.py
+### 1. config_parser.py
 
-**Purpose**: Core data structures
+**Purpose**: YAML Configuration Parser + Validation
 
-#### AxiTransaction
+#### Data Classes
+
+| Class | Description |
+|-------|-------------|
+| `CoreSpec` | Dir, BusByte, PPC, BPP, Plane |
+| `CtrlSpec` | VOTF, Qurgent, req_MO |
+| `BufferSpec` | Fifo, CTS, AXID, HWAPG, FRO |
+| `DmaIpSpec` | Complete IP spec (Core + Access + Ctrl + Buffer) |
+| `DependencyConfig` | wait_for, granularity, margin |
+| `BehaviorProfile` | type, pipeline_group, backpressure_source, block_size, flush_bytes |
+| `TaskConfig` | task_name, ip_name, clock, format, resolution, dependency, behavior |
+| `ScenarioConfig` | name, clock_domains, memory_policy, tasks |
+
+#### Sanity Check Validations
+
+1. Referenced IP exists in spec
+2. AccessType is supported by the IP
+3. Clock domain is defined
+4. Dependency targets exist as task names
+5. Backpressure source exists as a task
+
+---
+
+### 2. format_descriptor.py
+
+**Purpose**: Image format database and per-plane geometry computation
+
+#### FORMAT_DB
+
+Supported formats with sub-sampling metadata:
+
+| Format Family | Variants | Planes | Sub-sampling |
+|---------------|----------|--------|-------------|
+| YUV 4:2:0 | 8bit, 10bit (2-plane) | 2 | H:2, V:2 |
+| YUV 4:2:2 | 8bit, 10bit (2-plane) | 2 | H:2, V:1 |
+| YUV 4:4:4 | 8bit (3-plane) | 3 | H:1, V:1 |
+| RGB | 8bit, 10bit, RGBA | 1 | None |
+| Bayer | 8/10/12bit | 1 | None |
+| RAW | - | 1 | None |
+
+#### PlaneInfo Computation
+
+```python
+ImageFormatDescriptor.get_plane_info("YUV420_8bit_2plane", 1920, 1080)
+# → [PlaneInfo(0, 1920, 1080, 1.0, stride=1920, total=2073600),   # Y
+#    PlaneInfo(1,  960,  540, 2.0, stride=1920, total=1036800)]    # UV
+```
+
+Key properties:
+- `stride` = ceil(line_bytes / 64) × 64  (64B aligned)
+- UV plane: interleaved U+V → `bpp = bpp_component × 2`
+- Plane total = stride × height
+
+---
+
+### 3. domain_model.py
+
+**Purpose**: Core data model for AXI transactions
+
 ```python
 @dataclass
 class AxiTransaction:
-    id: int                    # Unique global ID
-    port: str                  # IP name (e.g., "CAM_FE")
-    type: str                  # ReadNoSnoop / WriteNoSnoop
-    address: int               # Memory address (hex)
-    bytes: int                 # Transfer size (64)
-    burst: str = "seq"         # Burst type
-    hint: Optional[str] = None # Cache hint (e.g., "LLC_ALLOC")
-    dep: List[str] = []        # ["target_id,event+offset", ...]
-    req_delay: Optional[int] = None  # Line delay in cycles
-    
-    def add_dependency(target_id, event, offset):
-        # Adds formatted dependency string
+    id: int                    # Unique ID (assigned by scheduler)
+    port: str                  # DMA port name
+    type: str                  # "ReadNoSnoop" | "WriteNoSnoop"
+    address: int               # Physical address (hex formatted)
+    bytes: int                 # Transfer size (≤ 64)
+    burst: str = "seq"
+    tick: Optional[int]        # Virtual Tick (YAML mode)
+    plane: int = 0             # Plane index (0=Y, 1=UV)
+    rw: str = "W"              # Internal R/W flag
+    iova: Optional[int]        # SMMU: pre-translation address
+    # Legacy fields: hint, dep, req_delay, deadline
 ```
 
-**Key Features**:
-- Immutable after creation (use `add_dependency()`)
-- `__str__()` formats for trace output
-- Dependency format: `dep=10,req+100|dep=5,resp+0`
+Output format:
+```
+tick=5 id=1 port=CAM_ISP_WR_0 type=WriteNoSnoop address=0x80000000 bytes=64 burst=seq
+```
 
 ---
 
-### 2. utils.py
+### 4. generator.py
 
-**Purpose**: Helper utilities
+**Purpose**: Transaction stream generation with 64B chopping and access patterns
 
-#### MultimediaUtils
+#### 64B Boundary Chopper
+
 ```python
-class MultimediaUtils:
-    @staticmethod
-    def calculate_bpp(color_format: str, bit_width: int) -> float:
-        # Bayer: bit_width / 8
-        # YUV: 1.5 * bit_width / 8
-        # RGB: 3 * bit_width / 8
-    
-    @staticmethod
-    def apply_compression(total_size: int, comp_ratio: float) -> int:
-        # Reduces size by compression ratio
-    
-    @staticmethod
-    def align_width_for_compression(h_size: int, color_format: str) -> int:
-        # Bayer: Align to 256 bytes
-        # YUV: Align to 32 bytes
-    
-    @staticmethod
-    def align_height_for_compression(v_size: int, color_format: str) -> int:
-        # YUV: Align to 4 lines
+chop_at_64b_boundary(addr=0x1030, size=64)
+# → [(0x1030, 16), (0x1040, 48)]
+# First chunk: 16B to reach next 64B boundary
+# Second chunk: remaining 48B within the next 64B boundary
 ```
 
-#### AddressAllocator
-```python
-class AddressAllocator:
-    def __init__(self, base=0x80000000):
-        # Align base address to 4KB (ion allocation requirement)
-        self._current = ((base + 0xFFF) // 0x1000) * 0x1000
-    
-    def allocate(self, size_bytes: int) -> int:
-        # Returns 4KB-aligned address
-        # Increments internal pointer
-```
+#### Access Patterns (Strategy Pattern)
 
-**Design Choice**: 4KB alignment prevents cache conflicts
+| Pattern | Description | Memory Layout |
+|---------|-------------|---------------|
+| `RasterOrderPattern` | Line-by-line scan respecting stride | Sequential rows |
+| `ZOrderPattern` | Macro-tile scan (default 64×32) | Tiled blocks, linearized |
+
+#### Stream Generation Pipeline
+
+```
+Task Config → get_plane_info() → per-plane:
+  AccessPattern.generate_addresses(plane, start_addr)
+    → yields (raw_addr, raw_size)
+      → chop_at_64b_boundary(raw_addr, raw_size)
+        → AxiTransaction(addr, chopped_size, plane=idx)
+          → Stream
+```
 
 ---
 
-### 3. generator.py
+### 5. scheduler.py
 
-**Purpose**: Transaction stream creation
+**Purpose**: Tick-based multi-agent simulation
 
-#### Stream
+#### Scoreboard
+
+Tracks producer progress for consumer dependency gating:
+
 ```python
-@dataclass
-class Stream:
-    ip_name: str
-    transactions: List[AxiTransaction]
-    metadata: Dict  # Optional context
+scoreboard.update("ISP_Write", completed_line=540)
+scoreboard.can_proceed("ISP_Write", required_line=530, margin=10)  # → True
 ```
 
-#### StreamGenerator
-```python
-class StreamGenerator:
-    def generate_stream(port, tx_type, start_addr, total_size, 
-                       burst_size=64, llc_enable=False, line_delay=0):
-        BURST_SIZE = 64
-        num_bursts = ceil(total_size / BURST_SIZE)
-        
-        transactions = []
-        for i in range(num_bursts):
-            addr = start_addr + (i * BURST_SIZE)
-            tx = AxiTransaction(
-                id=0,  # Assigned later
-                port=port,
-                type=tx_type,
-                address=addr,
-                bytes=min(BURST_SIZE, remaining),
-                hint="LLC_ALLOC" if llc_enable else None
-            )
-            
-            # Apply line delay to first transaction
-            if i == 0 and line_delay > 0:
-                tx.req_delay = line_delay
-            
-            transactions.append(tx)
-        
-        return Stream(port, transactions)
+#### DmaAgent
+
+Per-task simulation state:
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `bytes_per_tick` | PPC × BPP/8 | Data generated per clock |
+| `bus_byte` | IP Spec | Bus width for burst threshold |
+| `req_mo` | IP Spec | Max Outstanding requests |
+| `internal_buffer` | Accumulated | Virtual internal data buffer |
+| `stalled` | Runtime | Backpressure indicator |
+| `backpressure_source` | Scenario | Linked upstream agent |
+
+#### VirtualTickScheduler.run()
+
+```
+for tick in 0..max_ticks:
+    for agent in agents (round-robin):
+        if agent.finished: skip
+        if not dependency_satisfied: skip
+        txs = agent.strategy.step(tick, scoreboard)
+        if smmu.enabled: txs = apply_smmu(txs)
+        update scoreboard
+    if all finished: break
 ```
 
-**Key Decisions**:
-- Fixed BURST_SIZE = 64 bytes (AXI standard)
-- IDs assigned globally (not in generator)
-- Last transaction may be < 64 bytes
+#### build_scheduler() Factory
+
+Wires everything together:
+1. Parse configs → generate per-plane transaction pools
+2. Select BehaviorStrategy per task
+3. Create DmaAgent per task
+4. Register all agents in scheduler
 
 ---
 
-### 4. dependency.py
+### 6. behavior.py
 
-**Purpose**: Dependency constraint application
+**Purpose**: DMA behavioral modeling via Strategy Pattern
 
-#### DependencyManager
+#### EagerMOStrategy (Image RDMA/WDMA)
 
-**Intra-IP Methods**:
-```python
-def apply_rate_limiting(stream, rate):
-    """
-    TX[i] depends on TX[i-1] request + delay
-    
-    delay = (1.0 / rate - 1.0) * BURST_SIZE
-    Example: rate=0.5 → delay=128 cycles
-    """
-    for i, tx in enumerate(stream.transactions[1:], 1):
-        prev_tx = stream.transactions[i-1]
-        delay = calculate_delay(rate)
-        tx.add_dependency(prev_tx.id, "req", delay)
-
-def apply_outstanding_limit(stream, outstanding):
-    """
-    TX[i] depends on TX[i-outstanding] request
-    
-    Ensures max 'outstanding' transactions in flight
-    Note: Uses 'req' instead of 'resp' as there's no deadline mechanism
-    """
-    for i, tx in enumerate(stream.transactions[outstanding:], outstanding):
-        target_tx = stream.transactions[i - outstanding]
-        tx.add_dependency(target_tx.id, "req", 0)
+```
+Each tick:
+  1. Check backpressure → if upstream stalled, emit nothing
+  2. internal_buffer += PPC × BPP (bytes_per_tick)
+  3. While buffer ≥ BusByte AND MO budget > 0:
+       emit next transaction, decrement buffer and MO
 ```
 
-**Inter-IP Methods**:
-```python
-def apply_m2m_sync(producer_stream, consumer_stream, delay):
-    """
-    Frame-level sync: Consumer waits for producer's last TX
-    
-    consumer.transactions[0].dep = producer.transactions[-1],req+delay
-    """
-    last_producer = producer_stream.transactions[-1]
-    first_consumer = consumer_stream.transactions[0]
-    first_consumer.add_dependency(last_producer.id, "req", delay)
+Typical pattern: **Steady-stream** (1 tx per active tick)
 
-def apply_otf_sync(producer_stream, consumer_stream, delay):
-    """
-    Line-level sync: Consumer[line_k] waits for Producer[line_k]
-    
-    line_size_bytes = H_size * BPP
-    bursts_per_line = line_size_bytes / 64
-    
-    For each line k:
-        consumer_line_start = k * bursts_per_line
-        producer_line_start = k * bursts_per_line
-        consumer[consumer_line_start].dep = producer[producer_line_start],req+delay
-    """
+#### AccumulateAndFlushStrategy (Stat/Metadata DMA)
 
-def apply_m2m_group_sync(producer_streams, consumer_streams, delay):
-    """
-    Group-based M2M: All consumer DMAs wait for last-completing producer DMA
-    
-    Finds last TX across all producer streams, makes all consumer first TXs depend on it
-    """
-    
-def apply_otf_group_sync(producer_streams, consumer_streams):
-    """
-    Group-based OTF: Line-level sync between groups
-    
-    Line delay handled by req_delay attribute, not inter-IP dependencies
-    """
+```
+Each tick:
+  1. Check pipeline pixel progress via Scoreboard
+  2. If progress < Block_Size (e.g., 64×64 = 4096 pixels): silent
+  3. If triggered: burst Flush_Bytes / 64 transactions at once
 ```
 
-**Critical Design**:
-- Dependencies reference transaction **IDs**, not indices
-- Multiple dependencies use `|` separator
-- Events: `req` (request issued), `resp` (response received)
+Typical pattern: **Flush-burst** (4 tx per trigger, low duty cycle)
 
 ---
 
-### 5. main.py
+### 7. smmu_model.py
 
-**Purpose**: Orchestration and workflow
+**Purpose**: Mock IOVA → PA translation (optional, default disabled)
 
-#### AxiTrafficGenerator
-```python
-class AxiTrafficGenerator:
-    def __init__(self):
-        self.streams = {}           # {ip_name: {stream, job, group}}
-        self.allocator = AddressAllocator()
-        self.generator = StreamGenerator()
-        self.dep_manager = DependencyManager()
-    
-    def run(ip_csv, output_path, dep_csv=None):
-        # 1. Load configuration
-        jobs = load_ip_config(ip_csv)
-        dep_config = load_dependency_config(dep_csv) if dep_csv else None
-        
-        # 2. Generate streams
-        generate_streams(jobs)
-        
-        # 3. Assign IDs (CRITICAL: before dependencies!)
-        all_transactions = assign_transaction_ids()
-        
-        # 4. Apply dependencies
-        apply_intra_dependencies()
-        apply_inter_dependencies(dep_config)
-        
-        # 5. Export
-        export_trace(all_transactions, output_path)
-        generate_summary(output_path, summary_path)
+#### PhysicalAddressPool
+
+| Mode | Behavior |
+|------|----------|
+| CMA | Contiguous pages from reserved region (0x4000_0000+) |
+| SG | Random pages from general pool (0x8000_0000+) |
+
+Decision: `random() < cma_ratio` → CMA, else SG
+
+#### MockSMMU.translate(iova, size)
+
+1. Split range into 4KB pages
+2. For each page: map if unmapped (CMA or SG)
+3. Track TLB: first access → `is_new_page=True`
+4. Return list of `TranslationResult(pa, size, is_new_page)`
+
+#### PTW Injection
+
+On TLB miss, a 64B `ReadNoSnoop` is injected before the actual transaction:
+
 ```
-
-**Execution Order Critical**:
+ptw_addr = PT_BASE + (page_num % 0x10000) × 64
 ```
-Stream Generation
-       ↓
-   ID Assignment  ← Must happen BEFORE dependency application
-       ↓
-Intra-IP Dependencies (rate, outstanding)
-       ↓
-Inter-IP Dependencies (M2M, OTF)
-       ↓
-   Export Trace
-```
-
-**Execution- ✅ Flexible Configuration**: Separate IP and dependency configuration files
-- ✅ **Multiple Sync Types**: M2M (frame-level) and OTF (line-level) synchronization
-- ✅ **Compression Support**: Format-specific alignment with configurable ratios
-- ✅ **LLC Allocation Hints**: Last Level Cache optimization support
-- ✅ **Line Delay**: Configurable timing delays for stream synchronization
-- ✅ **Group-Based Dependencies**: Simplified dependency management
-- ✅ **Intra-IP Dependencies**: Rate limiting and outstanding buffer control
-- ✅ **Inter-IP Dependencies**: Chain and pipeline dependency support
-- ✅ **Automatic Analysis**: Built-in dependency summary with visual graph
-- ✅ **Standard Libraries Only**: No external dependencies requirednce transaction IDs. Without IDs, `dep=0,resp+0` occurs.
-
-**Why ID Assignment First?**  
-Dependencies reference transaction IDs. Without IDs, `dep=0,resp+0` occurs.
 
 ---
 
-### 6. gen_summary.py
+### 8. gen_summary.py
 
-**Purpose**: Trace analysis and visualization
+**Purpose**: Trace analysis + comprehensive report generation
 
-#### generate_summary()
-```python
-def generate_summary(trace_file, output_file):
-    # 1. Parse trace
-    transactions = parse_trace(trace_file)
-    
-    # 2. Categorize dependencies
-    ip_ranges = calculate_id_ranges()
-    intra_deps = find_intra_ip_deps(transactions, ip_ranges)
-    inter_deps = find_inter_ip_deps(transactions, ip_ranges)
-    
-    # 3. Build dependency graph
-    graph = build_dependency_graph(inter_deps)
-    
-    # 4. Write report
-    write_summary(output_file, graph, intra_deps, inter_deps)
+Auto-detects mode (tick-based YAML vs dep-based Legacy) and generates appropriate sections:
+
+**YAML Mode Sections**:
+
+| Section | Content |
+|---------|---------|
+| IP Overview | TX count, data volume, tick range per IP |
+| Simulation Stats | Duration, avg TX/tick, avg bandwidth |
+| BW Breakdown | Per-IP B/tick, percentage, total MB |
+| Address Ranges | Start/end address, span per IP |
+| 64B Compliance | Boundary violation count |
+| Behavior Analysis | Pattern classification (Steady/Flush/Eager), burst stats, duty cycle |
+
+**Legacy Mode Sections**:
+- Dependency graph, intra-IP deps (outstanding, rate), inter-IP deps (OTF, M2M)
+
+---
+
+## Data Flow
+
+### YAML Mode Pipeline
+
+```
+DMA_IP_Spec.yaml + Scenario.yaml
+    │
+    ▼
+ConfigParser.load_ip_spec() + load_scenario()
+    │
+    ▼
+ConfigParser.sanity_check()
+    │
+    ▼
+build_scheduler()
+  ├── ImageFormatDescriptor.get_plane_info()
+  ├── StreamGenerator.generate_streams_for_task()  ← per-plane, 64B chopping
+  ├── BehaviorStrategy selection (Eager / Accumulate)
+  ├── DmaAgent creation (per task)
+  └── VirtualTickScheduler setup
+    │
+    ▼
+VirtualTickScheduler.run()
+  ├── Tick loop (round-robin agents)
+  ├── Dependency gating (Scoreboard)
+  ├── Strategy.step() → transactions
+  ├── MockSMMU.translate() (if enabled)
+  └── Scoreboard.update()
+    │
+    ▼
+Assign sequential IDs → Export trace.txt
+    │
+    ▼
+generate_summary() → trace_summary.txt
 ```
 
-**Graph Algorithm**:
-```python
-# Topological-style traversal
-independent_nodes = all_producers - all_consumers
+### Legacy CSV Mode Pipeline
 
-def print_chain(node):
-    if node in adjacency:
-        for consumer, sync_type in adjacency[node]:
-            arrow = "=>" if sync_type == "M2M" else "->"
-            output(f"{node} {arrow} {consumer}")
-            print_chain(consumer)
+```
+ip_config.csv + dependency_config.csv
+    │
+    ▼
+AxiTrafficGenerator.load_ip_config()
+    │
+    ▼
+generate_streams() → per-IP Stream objects
+    │
+    ▼
+assign_transaction_ids()
+    │
+    ▼
+apply_intra_dependencies() (rate, outstanding)
+    │
+    ▼
+apply_inter_dependencies() (M2M, OTF)
+    │
+    ▼
+export_trace() → trace.txt + summary
+```
 
-for node in independent_nodes:
-    print_chain(node)
+---
+
+## Key Algorithms
+
+### 64B Boundary Chopping
+
+AXI protocol requires transactions not to cross 64-byte aligned boundaries.
+
+```
+Input:  addr=0x1030, size=64
+Step 1: Next boundary = 0x1040
+Step 2: First chunk = (0x1030, 16)   ← fills to boundary
+Step 3: Remaining = 48 bytes
+Step 4: Second chunk = (0x1040, 48)  ← within next boundary
+Output: [(0x1030, 16), (0x1040, 48)]
+```
+
+### Z-Order Tiling
+
+Tiles are laid out sequentially in memory (each tile = `tile_w × tile_h × bpp` bytes):
+
+```
+Image: 1920×1080, Tile: 64×32
+tiles_x = ⌈1920/64⌉ = 30
+tiles_y = ⌈1080/32⌉ = 34
+Total tiles = 1020
+
+Tile[ty][tx] base address = start + (ty × tiles_x + tx) × tile_bytes
+Within tile: sequential 64B reads/writes
+```
+
+### Behavior Strategy Selection
+
+| Behavior_Profile.Type | Strategy Class | Trigger |
+|----------------------|----------------|---------|
+| `Eager_MO_Burst` | `EagerMOStrategy` | Every tick (buffer ≥ BusByte) |
+| `Accumulate_and_Flush` | `AccumulateAndFlushStrategy` | Block_Size pixels processed |
+
+### Backpressure Propagation
+
+```
+ISP_Read.Backpressure_Source = "ISP_Write"
+
+Tick N:
+  ISP_Write.stalled = True (no buffer space)
+  → ISP_Read detects upstream stall → emits nothing
+  → ISP_Read.stalled = True
+
+Tick N+1:
+  ISP_Write resumes → ISP_Read resumes
 ```
 
 ---
 
 ## Dependency System
 
-### Dependency String Format
+### Scoreboard-Based (YAML Mode)
 
-**Single Dependency**:
-```
-dep=10,req+100
-```
-- Target ID: 10
-- Event: `req` (request) or `resp` (response)
-- Offset: +100 cycles
-
-**Multiple Dependencies**:
-```
-dep=10,req+100|dep=5,resp+0
-```
-- Separated by `|`
-- Evaluated as logical AND (all must be satisfied)
-
-### Dependency Resolution
-
-**Simulator Interpretation**:
-```python
-# For TX with dep=10,req+100|dep=5,resp+0
-can_issue = (
-    TX[10].request_issued + 100 cycles elapsed AND
-    TX[5].response_received
-)
+```yaml
+Dependency:
+  - Wait_For: "ISP_Write"
+    Granularity: "Line"
+    Margin: 10
 ```
 
-### Dependency Examples
+Semantics: Consumer can process line `L` only when producer has completed line `L - margin`.
 
-**Line Delay**:
-```
-TX 1: req=100         # First transaction delayed by 100 cycles
-TX 2: (no req delay)
-...
-```
+### dep-Based (Legacy Mode)
 
-**Outstanding Limit (8)**:
-```
-TX 1: (no dep)
-TX 2: (no dep)
-...
-TX 8: (no dep)
-TX 9: dep=1,req+0     # Wait for TX 1 request
-TX 10: dep=2,req+0    # Wait for TX 2 request
-```
-
-**Rate Limiting (rate=0.5)**:
-```
-TX 1: (no dep)
-TX 2: dep=1,req+128    # 128 = (1/0.5 - 1) * 64
-TX 3: dep=2,req+128
-```
-
-**M2M Sync**:
-```
-# GPU_WR last TX: id=128124
-# DISP_RD first TX: 
-dep=128124,req+200     # Wait for GPU_WR frame + 200 cycles
-```
-
-**LLC Hint**:
-```
-# ISP_FE with LLC enabled:
-id=21601 port=ISP_FE type=ReadNoSnoop address=0x80152000 bytes=64 
-         burst=seq hint=LLC_ALLOC
-```
-
-**OTF Sync** (line 0, assuming 30 bursts/line):
-```
-# CAM_FE line 0 starts at TX 1
-# ISP_FE line 0 starts at TX 40501
-ISP_FE TX 40501: dep=1,req+100     # 100 cycle delay
-ISP_FE TX 40531: dep=31,req+100    # Next line
-```
+| Type | Format | Meaning |
+|------|--------|---------|
+| Intra-IP rate | `dep=N-1,req+128` | Wait 128 cycles after previous TX request |
+| Intra-IP outstanding | `dep=N-8,resp+0` | Wait for TX N-8 response |
+| Inter-IP OTF | `dep=K,req+0` | Wait for producer TX K request |
+| Inter-IP M2M | `dep=K,resp+200` | Wait for producer last TX response + 200 cycles |
 
 ---
 
-## Extension Points
+## Appendix: Legacy CSV Mode
 
-### Adding New Color Formats
+### ip_config.csv Fields
 
-**Location**: `utils.py → MultimediaUtils.calculate_bpp()`
+| Field | Description |
+|-------|-------------|
+| IP | IP name |
+| GroupName | Group identifier for dependency matching |
+| In/Out | Direction (In=Read, Out=Write) |
+| H size, V size | Resolution |
+| Color Format | Bayer, YUV, or RGB |
+| Bit Width | Bits per pixel component |
+| R/W Rate | Bandwidth ratio (0.0-1.0) |
+| Outstanding | Buffer depth |
+| Comp Mode/Ratio | Compression enable + ratio |
+| LLC Enable | LLC allocation hint |
+| Line Delay | Initial line delay (cycles) |
 
-```python
-def calculate_bpp(color_format, bit_width):
-    format_map = {
-        'Bayer': lambda bw: bw / 8,
-        'YUV': lambda bw: 1.5 * bw / 8,
-        'RGB': lambda bw: 3 * bw / 8,
-        'RGBA': lambda bw: 4 * bw / 8,  # ADD NEW FORMAT
-    }
-```
+### dependency_config.csv Fields
 
-### Custom Dependency Types
-
-**Location**: `dependency.py → DependencyManager`
-
-```python
-def apply_custom_sync(producer_stream, consumer_stream, params):
-    # Implement custom synchronization logic
-    for i, tx in enumerate(consumer_stream.transactions):
-        # Add custom dependency
-        tx.add_dependency(target_id, event, offset)
-```
-
-### Transaction Metadata
-
-**Location**: `domain_model.py → AxiTransaction`
-
-```python
-@dataclass
-class AxiTransaction:
-    ...
-    metadata: Dict = field(default_factory=dict)  # ADD
-```
-
-### Alternative Export Formats
-
-**Location**: `main.py → export_trace()`
-
-```python
-def export_json(transactions, output_path):
-    import json
-    data = [asdict(tx) for tx in transactions]
-    with open(output_path, 'w') as f:
-        json.dump(data, f, indent=2)
-```
-
----
-
-## Performance Considerations
-
-### Memory Usage
-
-- **Transaction Count**: ~154K for test scenario
-- **Memory per TX**: ~200 bytes (Python object overhead)
-- **Total**: ~30 MB for typical scenario
-- **Scalability**: Linear O(N) with transaction count
-
-### Processing Time
-
-- **Parsing**: O(N) rows in CSV
-- **Generation**: O(N) transactions
-- **Dependency**: O(N × D) where D = avg dependencies per TX
-- **Export**: O(N) transactions
-- **Total**: ~1-2 seconds for 150K transactions
-
-### Optimization Opportunities
-
-1. **Batch Processing**: Group transactions by IP for cache locality
-2. **Lazy Evaluation**: Generate transactions on-demand
-3. **Parallel Generation**: Multi-threaded stream creation
-4. **Binary Export**: Use pickle/msgpack for faster I/O
-
----
-
-## Testing Strategy
-
-### Unit Tests (Recommended)
-- `test_bpp_calculation()`: Verify all color formats
-- `test_address_alignment()`: Ensure 4KB alignment
-- `test_burst_splitting()`: Edge cases (size < 64, size % 64 != 0)
-- `test_dependency_ordering()`: ID assignment before dependency
-- `test_rate_calculation()`: Verify delay formula
-
-### Integration Tests
-- `test_m2m_chain()`: Full chain dependency
-- `test_otf_sync()`: Line-by-line verification
-- `test_mixed_scenario()`: OTF + M2M combination
-
-### Validation
-- `check_deps.py`: Quick sanity check
-- `gen_summary.py`: Comprehensive analysis
-
----
-
-## Known Limitations
-
-1. **Fixed Burst Size**: Always 64 bytes (AXI standard)
-2. **Sequential IDs**: No support for transaction reordering
-3. **Static Configuration**: No runtime parameter changes
-4. **Single Address Space**: No multi-channel support
-5. **CSV Comments**: Not supported (use separate scenario files)
-
----
-
-## Future Enhancements
-
-### Planned Features
-- [ ] JSON configuration support
-- [ ] Multi-channel address spaces
-- [ ] Dynamic dependency insertion
-- [ ] Performance metrics (bandwidth, latency)
-- [ ] Graphviz visualization
-- [ ] SimPy integration for cycle-accurate simulation
-
-### Community Requests
-- [ ] GUI configuration tool
-- [ ] Real-time trace viewer
-- [ ] Regression test suite
-- [ ] Docker containerization
-
----
-
-## Appendix
-
-### Terminology
-
-- **Burst**: Contiguous 64-byte AXI transfer
-- **Stream**: Sequence of transactions for single IP
-- **M2M**: Memory-to-Memory (frame-level sync)
-- **OTF**: On-The-Fly (line-level sync)
-- **Outstanding**: Max in-flight transactions
-- **BPP**: Bytes Per Pixel
-- **Intra-IP**: Within single IP
-- **Inter-IP**: Between different IPs
-
-### References
-
-- AXI Protocol Specification (ARM IHI 0022)
-- Python Dataclasses (PEP 557)
-- CSV Format (RFC 4180)
+| Field | Description |
+|-------|-------------|
+| Consumer Group | Group waiting for sync |
+| Producer Group | Group providing sync |
+| Sync Type | M2M (frame) or OTF (line) |
+| Delay | Additional cycles |

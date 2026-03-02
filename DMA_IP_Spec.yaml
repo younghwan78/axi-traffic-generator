@@ -1,0 +1,26 @@
+# DMA IP Hardware Specification
+# 정적 하드웨어 스펙 정의 파일 - IP별 물리적 속성
+
+CAM_ISP_WR_0:
+  Core:   { Dir: W, BusByte: 32, PPC: 4, BPP: 12, Plane: 2 }
+  Access: [ raster-order, Z-order ]
+  Ctrl:   { VOTF: true, VOTF_stall: false, Qurgent: true, req_MO: 8 }
+  Buffer: { Fifo: 2048, CTS: 256, AXID: 4, usr_w: 8, HWAPG: true, FRO: 4 }
+
+CAM_ISP_RD_0:
+  Core:   { Dir: R, BusByte: 32, PPC: 4, BPP: 12, Plane: 1 }
+  Access: [ raster-order ]
+  Ctrl:   { VOTF: false, VOTF_stall: false, Qurgent: true, req_MO: 8 }
+  Buffer: { Fifo: 1024, CTS: 128, AXID: 4, usr_w: 8, HWAPG: true, FRO: 2 }
+
+CAM_STAT_WR_0:
+  Core:   { Dir: W, BusByte: 16, PPC: 1, BPP: 8, Plane: 1 }
+  Access: [ raster-order ]
+  Ctrl:   { VOTF: false, VOTF_stall: false, Qurgent: false, req_MO: 4 }
+  Buffer: { Fifo: 512, CTS: 64, AXID: 2, usr_w: 4, HWAPG: false, FRO: 1 }
+
+DISP_RD_0:
+  Core:   { Dir: R, BusByte: 16, PPC: 2, BPP: 10, Plane: 1 }
+  Access: [ raster-order ]
+  Ctrl:   { VOTF: false, VOTF_stall: false, Qurgent: false, req_MO: 4 }
+  Buffer: { Fifo: 1024, CTS: 128, AXID: 4, usr_w: 8, HWAPG: true, FRO: 2 }

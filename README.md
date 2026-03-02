@@ -1,218 +1,166 @@
 # AXI Traffic Generator
 
-Python-based AXI Traffic Generator for SoC Multimedia Simulation. Converts high-level CSV scenarios into low-level AXI transaction traces with comprehensive dependency management.
+Python-based AXI Traffic Generator for SoC Multimedia Simulation. Generates realistic AXI transaction traces with tick-based scheduling, 64B boundary chopping, multi-plane DMA modeling, and optional SMMU simulation.
 
 ## Features
 
-- ✅ **Flexible Configuration**: Separate IP and dependency configuration files
-- ✅ **Multiple Sync Types**: M2M (frame-level) and OTF (line-level) synchronization
-- ✅ **Compression Support**: Format-specific alignment (Bayer, YUV) with configurable ratios
-- ✅ **LLC Allocation Hints**: Last Level Cache optimization support
-- ✅ **Line Delay**: Configurable timing delays for stream synchronization
-- ✅ **Group-Based Dependencies**: Simplified dependency management at IP group level
-- ✅ **Intra-IP Dependencies**: Rate limiting and outstanding buffer control
-- ✅ **Inter-IP Dependencies**: Chain and pipeline dependency support
-- ✅ **Automatic Analysis**: Built-in dependency summary with visual graph
-- ✅ **Standard Libraries Only**: No external dependencies required
+- ✅ **YAML Configuration**: DMA IP hardware spec + dynamic scenario definition
+- ✅ **64B Boundary Chopping**: All transactions respect 64-byte AXI boundary
+- ✅ **Access Patterns**: Raster-order and Z-order (tiled) memory access
+- ✅ **Multi-Plane DMA**: Per-plane independent streams (Y/UV separation)
+- ✅ **Virtual Tick Scheduler**: Clock-domain aware multi-agent simulation
+- ✅ **Behavior Strategies**: Eager_MO_Burst (image DMA) and Accumulate_and_Flush (stat data)
+- ✅ **SMMU Modeling**: Optional IOVA→PA translation with CMA/SG fragmentation and PTW injection
+- ✅ **Dependency & Backpressure**: Scoreboard-based line/tile/frame dependency gating
+- ✅ **Traffic Analysis**: Bandwidth breakdown, address range, 64B compliance, behavior pattern detection
+- ✅ **Legacy CSV Support**: Backward compatibility with existing CSV-based workflows
 
 ## Quick Start
 
-### 1. Configure IPs
-Edit `ip_config.csv`:
-```csv
-IP,GroupName,In/Out,H size,V size,Color Format,Bit Width,R/W Rate,Outstanding,Comp Mode,Comp Ratio,LLC Enable,Line Delay
-CAM_FE,CAM,Out,1920,1080,Bayer,10,1.0,8,Enable,0.5,Disable,100
-ISP_FE,INTCAM,In,1920,1080,Bayer,10,1.0,16,Disable,,Enable,0
-ISP_WR,INTCAM,Out,1920,1080,YUV,8,0.8,12,Enable,0.6,Enable,50
-GPU_WR,GPU,Out,1024,768,RGB,8,0.5,8,Disable,,Disable,0
-DISP_RD,DPU,In,1024,768,RGB,8,1.0,16,Disable,,Enable,0
+### YAML Mode (Recommended)
+
+**1. Define IP Hardware Spec** — `DMA_IP_Spec.yaml`:
+```yaml
+CAM_ISP_WR_0:
+  Core:   { Dir: W, BusByte: 32, PPC: 4, BPP: 12, Plane: 2 }
+  Access: [ raster-order, Z-order ]
+  Ctrl:   { VOTF: true, Qurgent: true, req_MO: 8 }
+  Buffer: { Fifo: 2048, CTS: 256, AXID: 4, HWAPG: true, FRO: 4 }
 ```
 
-### 2. Configure Dependencies (Optional)
-Edit `dependency_config.csv`:
-```csv
-Consumer Group,Producer Group,Sync Type,Delay
-INTCAM,CAM,OTF,0
-DPU,GPU,M2M,200
+**2. Define Scenario** — `Scenario_4K.yaml`:
+```yaml
+Scenario_Info:
+  Name: "4K_Camera_to_Display"
+Clock_Domains:
+  MM: 800
+  UD: 533
+Memory_Policy:
+  SMMU_Enable: false
+  CMA_Ratio: 0.3
+Tasks:
+  - TaskName: "ISP_Write"
+    IP_Name: "CAM_ISP_WR_0"
+    Clock: "MM"
+    Format: "YUV420_8bit_2plane"
+    Resolution: [3840, 2160]
+    AccessType: "raster-order"
+    Behavior_Profile:
+      Type: "Eager_MO_Burst"
+      Pipeline_Group: "CAM_FE_PIPE"
 ```
 
-### 3. Generate Trace
+**3. Generate Trace**:
 ```powershell
-python main.py ip_config.csv output.txt dependency_config.csv
+python main.py --yaml DMA_IP_Spec.yaml Scenario_4K.yaml trace.txt
 ```
 
-### 4. Output
-- `output.txt` - AXI transaction trace (164,988 transactions)
-- `output_summary.txt` - Dependency analysis with visual graph
+**4. Output**:
+- `trace.txt` — Tick-based AXI transaction trace
+- `trace_summary.txt` — Traffic analysis report
+
+### Legacy CSV Mode
+
+```powershell
+python main.py ip_config.csv trace.txt dependency_config.csv
+```
 
 ## Project Structure
 
 ```
 21_MMIP_TG/
-├── main.py                    # Main orchestrator
-├── domain_model.py            # AxiTransaction dataclass
-├── utils.py                   # Multimedia & address utilities
-├── generator.py               # Stream generator
-├── dependency.py              # Dependency manager
-├── gen_summary.py             # Summary generator
-├── check_deps.py              # Quick dependency checker
-├── ip_config.csv              # IP configuration
-├── dependency_config.csv      # Dependency configuration
-├── test_scenario.csv          # Legacy format example
-├── README.md                  # This file
-├── DESIGN.md                  # Architecture documentation
-└── README_DEPENDENCY.md       # Dependency scenarios guide
+├── main.py                # Main orchestrator (YAML + CSV modes)
+├── config_parser.py       # YAML parser + sanity check
+├── format_descriptor.py   # Image format DB + plane geometry
+├── domain_model.py        # AxiTransaction dataclass
+├── generator.py           # 64B chopping + access patterns + per-plane streams
+├── scheduler.py           # Virtual Tick scheduler + Scoreboard + DmaAgent
+├── behavior.py            # Behavior strategies (Eager MO / Accumulate & Flush)
+├── smmu_model.py          # Mock SMMU (IOVA→PA, PTW injection)
+├── dependency.py          # Legacy inter/intra-IP dependency manager
+├── gen_summary.py         # Traffic & dependency summary generator
+├── utils.py               # Address allocation + multimedia utilities
+├── check_deps.py          # Quick dependency checker
+├── DMA_IP_Spec.yaml       # Example IP hardware spec
+├── Scenario_4K.yaml       # Example 4K scenario
+├── ip_config.csv          # Legacy IP config (CSV)
+├── dependency_config.csv  # Legacy dependency config (CSV)
+├── README.md              # This file
+├── DESIGN.md              # Architecture documentation
+└── 개선사항.md              # Improvement requirements spec
 ```
-
-## Usage Examples
-
-### Basic Usage
-```powershell
-# With dependencies
-python main.py ip_config.csv trace.txt dependency_config.csv
-
-# Without dependencies (parallel execution)
-python main.py ip_config.csv trace.txt
-
-# Legacy format (single CSV)
-python main.py test_scenario.csv trace.txt
-```
-
-### Quick Dependency Check
-```powershell
-python check_deps.py trace.txt
-```
-
-## Configuration Guide
-
-### IP Configuration Fields
-
-| Field | Required | Default | Description |
-|-------|----------|---------|-------------|
-| IP | ✓ | - | IP name (e.g., "CAM_FE") |
-| GroupName | ✓ | - | Group identifier |
-| In/Out | ✓ | - | "In" (Read) or "Out" (Write) |
-| H size | ✓ | - | Horizontal resolution (pixels) |
-| V size | ✓ | - | Vertical resolution (lines) |
-| Color Format | ✓ | - | Bayer, YUV, or RGB |
-| Bit Width | ✓ | - | Bits per pixel component |
-| R/W Rate | | 1.0 | Bandwidth ratio (0.0-1.0) |
-| Outstanding | | 16 | Buffer depth |
-| **Comp Mode** | | Disable | Enable/Disable compression |
-| **Comp Ratio** | | - | Compression ratio (e.g., 0.5 for 50%) |
-| **LLC Enable** | | Disable | Enable/Disable LLC allocation hint |
-| **Line Delay** | | 0 | Initial line delay in cycles |
-
-### Advanced Features
-
-#### Compression Support
-- **Comp Mode**: `Enable` or `Disable`
-- **Comp Ratio**: Compression ratio (0.0-1.0)
-- **Format-Specific Alignment**:
-  - **Bayer**: Width aligned to 256 bytes
-  - **YUV**: Width to 32 bytes, Height to 4 lines
-  - **RGB**: No special alignment
-
-#### LLC Allocation Hints
-- `LLC Enable=Enable`: Adds `hint=LLC_ALLOC` to all transactions
-- Optimizes Last Level Cache allocation for multimedia workloads
-
-#### Line Delay
-- `Line Delay=100`: First transaction delayed by 100 cycles
-- Displayed as `req=100` in trace output
-- Used for stream synchronization timing
-
-### Dependency Configuration
-
-**Legacy Format (DMA-based)**:
-| Field | Description | Example |
-|-------|-------------|---------| 
-| Consumer | IP waiting for sync | ISP_FE |
-| Producer | IP providing sync | CAM_FE |
-| Sync Type | M2M (frame) or OTF (line) | OTF |
-| Delay | Additional cycles | 100 |
-
-**New Format (Group-based)**:
-| Field | Description | Example |
-|-------|-------------|---------|
-| **Consumer Group** | Group waiting for sync | INTCAM |
-| **Producer Group** | Group providing sync | CAM |
-| Sync Type | M2M (frame) or OTF (line) | OTF |
-| Delay | Additional cycles | 0 |
-
-**Group-based Benefits**:
-- Simplified configuration (group-level vs DMA-level)
-- M2M: All consumer DMAs wait for last-completing producer DMA
-- OTF: Line delay handled automatically via `Line Delay` field
-
-## Dependency Types
-
-### Intra-IP (Within IP)
-- **Outstanding Limit**: Controls buffer depth
-  - TX N depends on TX (N - outstanding) **request** + 0 cycles
-- **Rate Limiting**: Controls bandwidth
-  - TX N depends on TX (N-1) request + delay cycles
-  - Delay = `(1/rate - 1) × 64 bytes`
-
-### Inter-IP (Between IPs)
-- **M2M (Memory-to-Memory)**: Frame-level sync
-  - Consumer waits for producer's entire frame completion
-  - Example: `DISP_RD => GPU_WR`
-  - Group Format: All DPU DMAs wait for last GPU DMA
-- **OTF (On-The-Fly)**: Line-level sync
-  - Consumer processes line-by-line with producer
-  - Example: `CAM_FE -> ISP_FE`
-  - Timing controlled by `Line Delay` field
 
 ## Output Format
 
-### Trace File
+### YAML Mode (tick-based)
+```
+tick=5 id=1 port=CAM_ISP_WR_0 type=WriteNoSnoop address=0x80000000 bytes=64 burst=seq
+tick=517 id=119 port=CAM_STAT_WR_0 type=WriteNoSnoop address=0x817bc000 bytes=64 burst=seq
+```
+
+### Legacy CSV Mode (dep-based)
 ```
 id=1 port=CAM_FE type=WriteNoSnoop address=0x80000000 bytes=64 burst=seq req=100
-id=9 port=CAM_FE type=WriteNoSnoop address=0x80000200 bytes=64 burst=seq dep=1,req+0
-id=21601 port=ISP_FE type=ReadNoSnoop address=0x80152000 bytes=64 burst=seq hint=LLC_ALLOC dep=1,req+0
+id=21601 port=ISP_FE type=ReadNoSnoop address=0x80152000 bytes=64 burst=seq dep=1,req+0
 ```
 
-**Key Attributes**:
-- `id`: Unique transaction identifier
-- `port`: DMA/IP name
-- `type`: ReadNoSnoop or WriteNoSnoop
-- `address`: Memory address (hex)
-- `bytes`: Transfer size (typically 64)
-- `burst`: Burst type (seq = sequential)
-- `req=<N>`: Line delay (initial timing delay)
-- `hint=<H>`: Cache hint (LLC_ALLOC for LLC optimization)
-- `dep=<id>,<event>+<offset>`: Dependency on transaction <id>
-
-### Summary File
+### Summary Report (YAML mode)
 ```
-[*] Dependency Graph:
-  CAM_FE -> ISP_FE (OTF)
-  GPU_WR => DISP_RD (M2M)
+[*] IP Transaction Overview:
+  CAM_ISP_WR_0         [WR] :  194400 tx  (12,150.0 KB)  tick 5 ~ 2,073,594
+  CAM_STAT_WR_0        [WR] :   16904 tx  (1,056.5 KB)  tick 517 ~ 2,073,583
 
-[>] CAM_FE
-  Outstanding Limit: Active (interval = 8)
-  Rate Limiting: None
+[*] Per-IP Bandwidth Breakdown:
+  CAM_ISP_WR_0         :      6.0 B/tick  ( 32.4%)  [11.87 MB]
 
-[>] GPU_WR
-  Rate Limiting: Active (delay = 128 cycles)
+[*] 64B Boundary Compliance:
+  ✓ All 600,104 transactions comply with 64B boundary alignment
+
+[*] Behavior Pattern Analysis:
+  CAM_ISP_WR_0         : Steady-stream    avg_burst=1.0  max_burst=1  duty=9.4%
+  CAM_STAT_WR_0        : Flush-burst      avg_burst=4.0  max_burst=4  duty=0.2%
 ```
+
+## Configuration Reference
+
+### DMA_IP_Spec.yaml
+
+| Section | Field | Description |
+|---------|-------|-------------|
+| **Core** | Dir | R (Read) or W (Write) |
+| | BusByte | Bus width in bytes (16, 32) |
+| | PPC | Pixels Per Clock |
+| | BPP | Bits Per Pixel |
+| | Plane | Number of planes (1, 2, 3) |
+| **Access** | - | List: `raster-order`, `Z-order` |
+| **Ctrl** | VOTF | Virtual OTF enable |
+| | Qurgent | Quality-Urgent signaling |
+| | req_MO | Max Outstanding requests |
+| **Buffer** | Fifo | Internal FIFO size (bytes) |
+| | CTS | Client Transaction Size |
+
+### Scenario.yaml
+
+| Section | Field | Description |
+|---------|-------|-------------|
+| **Clock_Domains** | \<name\>: MHz | Clock domain frequency |
+| **Memory_Policy** | SMMU_Enable | Enable SMMU simulation |
+| | CMA_Ratio | Contiguous memory ratio (0.0-1.0) |
+| **Tasks[]** | IP_Name | Reference to DMA_IP_Spec entry |
+| | Format | Image format (e.g., `YUV420_8bit_2plane`) |
+| | Resolution | [width, height] |
+| | AccessType | `raster-order` or `Z-order` |
+| | Dependency[] | Wait_For, Granularity, Margin |
+| | Behavior_Profile | Type, Pipeline_Group, Backpressure_Source |
+
+### Supported Image Formats
+
+`YUV420_8bit_2plane`, `YUV420_10bit_2plane`, `YUV422_8bit_2plane`, `YUV422_10bit_2plane`, `YUV444_8bit_3plane`, `RGB_8bit`, `RGB_10bit`, `RGBA_8bit`, `Bayer_8bit`, `Bayer_10bit`, `Bayer_12bit`, `RAW`
 
 ## Requirements
 
 - Python 3.9+
-- No external libraries required (standard library only)
-
-## Examples
-
-See `README_DEPENDENCY.md` for detailed scenario examples:
-- Mixed Pipeline (OTF + M2M)
-- Full Chain (sequential M2M)
-- Independent (no dependencies)
-
-## Design
-
-See `DESIGN.md` for detailed architecture and module documentation.
+- PyYAML (`pip install pyyaml`)
 
 ## License
 
