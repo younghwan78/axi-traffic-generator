@@ -201,11 +201,23 @@ class VirtualTickScheduler:
         """
         Run simulation until all agents finish or *max_ticks* reached.
 
+        Uses clock-proportional scheduling: agents with higher clock
+        frequencies step more often.  Each tick, every agent accumulates
+        its clock_mhz; when the accumulator reaches max_clock the agent
+        is allowed to execute one step.
+
         Returns:
             All emitted transactions in tick order
         """
         self.link_backpressure()
         all_transactions: List[AxiTransaction] = []
+
+        # Determine max clock for accumulator threshold
+        max_clock = max(a.clock_mhz for a in self._agent_list)
+
+        # Initialise per-agent clock accumulators
+        for agent in self._agent_list:
+            agent._clock_accum = 0
 
         for tick in range(max_ticks):
             self.tick = tick
@@ -215,6 +227,12 @@ class VirtualTickScheduler:
                 if agent.finished:
                     continue
                 any_active = True
+
+                # Clock-proportional gating
+                agent._clock_accum += agent.clock_mhz
+                if agent._clock_accum < max_clock:
+                    continue
+                agent._clock_accum -= max_clock
 
                 # Dependency gate
                 if not self._check_dependency(agent):
@@ -312,11 +330,19 @@ def build_scheduler(specs: Dict[str, DmaIpSpec],
 
     for task in scenario.tasks:
         ip_spec = specs[task.ip_name]
-        clock_mhz = scenario.clock_domains.get(task.clock, 800)
+        clock_mhz = task.clock
         tx_type = "ReadNoSnoop" if ip_spec.core.dir == "R" else "WriteNoSnoop"
 
         # --- Generate transaction pool ---
         all_txs: List[AxiTransaction] = []
+
+        # Allocate memory (SBWC needs extra for header region)
+        alloc_size = ImageFormatDescriptor.get_total_size(
+            task.format, task.resolution[0], task.resolution[1])
+        if task.sbwc_ratio > 0:
+            # Add ~20% overhead for header regions
+            alloc_size = int(alloc_size * (task.sbwc_ratio + 0.2))
+
         streams = StreamGenerator.generate_streams_for_task(
             port=task.ip_name,
             tx_type=tx_type,
@@ -324,12 +350,8 @@ def build_scheduler(specs: Dict[str, DmaIpSpec],
             width=task.resolution[0],
             height=task.resolution[1],
             access_type=task.access_type,
-            base_addr=allocator.allocate(
-                ImageFormatDescriptor.get_total_size(
-                    task.format, task.resolution[0], task.resolution[1]
-                ),
-                task.ip_name,
-            ),
+            base_addr=allocator.allocate(alloc_size, task.ip_name),
+            sbwc_ratio=task.sbwc_ratio,
         )
         for s in streams:
             all_txs.extend(s.transactions)

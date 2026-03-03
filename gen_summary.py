@@ -13,7 +13,9 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 
-def generate_summary(trace_file: str, output_file: str = 'dependency_summary.txt') -> None:
+def generate_summary(trace_file: str, output_file: str = 'dependency_summary.txt',
+                     clock_map: Optional[Dict[str, int]] = None,
+                     ip_configs: Optional[Dict[str, Dict]] = None) -> None:
     """
     Generate comprehensive summary from trace file.
     Auto-detects YAML mode (tick=...) vs legacy mode (dep=...).
@@ -21,6 +23,10 @@ def generate_summary(trace_file: str, output_file: str = 'dependency_summary.txt
     Args:
         trace_file: Path to trace file
         output_file: Path to output summary file
+        clock_map: Optional dict mapping IP name to clock frequency (MHz)
+        ip_configs: Optional dict mapping IP name to config dict with keys:
+                    dir, bus_byte, ppc, bpp, plane, clock_mhz, access_type,
+                    behavior, req_mo, format, resolution
     """
     print(f"Analyzing {trace_file}...")
     transactions = []
@@ -86,36 +92,124 @@ def generate_summary(trace_file: str, output_file: str = 'dependency_summary.txt
         out.write("[*] IP Transaction Overview:\n")
         out.write("-" * 80 + "\n")
         total_bytes = 0
-        for port in sorted(ip_txs.keys()):
-            txs = ip_txs[port]
-            count = len(txs)
-            id_range = ip_ranges[port]
-            port_bytes = sum(tx['bytes'] for tx in txs)
-            total_bytes += port_bytes
 
-            rw = txs[0]['type'] if txs else ''
-            dir_label = 'WR' if 'Write' in rw else 'RD'
+        # Pre-calculate per-port bytes
+        port_bytes_map = {}
+        for port, txs in ip_txs.items():
+            port_bytes_map[port] = sum(tx['bytes'] for tx in txs)
+            total_bytes += port_bytes_map[port]
 
-            if is_yaml_mode and txs[0]['tick'] is not None:
-                ticks = [tx['tick'] for tx in txs if tx['tick'] is not None]
-                tick_min, tick_max = min(ticks), max(ticks)
+        # Group by IP if ip_configs available
+        if ip_configs and is_yaml_mode:
+            # Build IP group → DMA list mapping
+            ip_groups = defaultdict(list)
+            for port in sorted(ip_txs.keys()):
+                cfg = ip_configs.get(port, {})
+                group = cfg.get('ip_group', port)
+                ip_groups[group].append(port)
+
+            for group_name in sorted(ip_groups.keys()):
+                ports = ip_groups[group_name]
+                out.write(f"  [{group_name}]\n")
+                group_bytes = 0
+                group_count = 0
+                for port in ports:
+                    txs = ip_txs[port]
+                    count = len(txs)
+                    pb = port_bytes_map[port]
+                    group_bytes += pb
+                    group_count += count
+                    rw = txs[0]['type'] if txs else ''
+                    dir_label = 'WR' if 'Write' in rw else 'RD'
+                    ticks = [tx['tick'] for tx in txs if tx['tick'] is not None]
+                    tick_min, tick_max = min(ticks), max(ticks)
+                    out.write(
+                        f"    {port:20s} [{dir_label}] : {count:7d} tx  "
+                        f"({pb / 1024:,.1f} KB)  "
+                        f"tick {tick_min:,} ~ {tick_max:,}\n"
+                    )
                 out.write(
-                    f"  {port:20s} [{dir_label}] : {count:7d} tx  "
-                    f"({port_bytes / 1024:,.1f} KB)  "
-                    f"tick {tick_min:,} ~ {tick_max:,}\n"
+                    f"    {'── Subtotal':20s}       : {group_count:7d} tx  "
+                    f"({group_bytes / 1024 / 1024:,.2f} MB)\n\n"
                 )
-            else:
-                out.write(
-                    f"  {port:20s} [{dir_label}] : {count:7d} tx  "
-                    f"(ID {id_range[0]:6d} - {id_range[1]:6d})  "
-                    f"({port_bytes / 1024:,.1f} KB)\n"
-                )
+        else:
+            for port in sorted(ip_txs.keys()):
+                txs = ip_txs[port]
+                count = len(txs)
+                id_range = ip_ranges[port]
+                pb = port_bytes_map[port]
+                rw = txs[0]['type'] if txs else ''
+                dir_label = 'WR' if 'Write' in rw else 'RD'
 
-        out.write(f"\n  {'TOTAL':20s}       : {len(transactions):7d} tx  "
+                if is_yaml_mode and txs[0]['tick'] is not None:
+                    ticks = [tx['tick'] for tx in txs if tx['tick'] is not None]
+                    tick_min, tick_max = min(ticks), max(ticks)
+                    out.write(
+                        f"  {port:20s} [{dir_label}] : {count:7d} tx  "
+                        f"({pb / 1024:,.1f} KB)  "
+                        f"tick {tick_min:,} ~ {tick_max:,}\n"
+                    )
+                else:
+                    out.write(
+                        f"  {port:20s} [{dir_label}] : {count:7d} tx  "
+                        f"(ID {id_range[0]:6d} - {id_range[1]:6d})  "
+                        f"({pb / 1024:,.1f} KB)\n"
+                    )
+
+        out.write(f"  {'TOTAL':20s}       : {len(transactions):7d} tx  "
                   f"({total_bytes / 1024 / 1024:,.2f} MB)\n")
 
         # ====================================================================
-        #  Section 2: Tick-based Analysis (YAML mode only)
+        #  Section 2: DMA Configuration Summary (YAML mode only)
+        # ====================================================================
+        if ip_configs and is_yaml_mode:
+            out.write("\n" + "=" * 80 + "\n")
+            out.write("DMA CONFIGURATION SUMMARY\n")
+            out.write("=" * 80 + "\n\n")
+
+            # Header
+            hdr = (f"  {'DMA Name':20s}  {'IP':12s}  {'Dir':3s}  {'Bus':4s}  {'Burst':6s}"
+                   f"  {'PPC':3s}  {'BPP':4s}  {'Pln':3s}  {'Clock':7s}"
+                   f"  {'Access':8s}  {'Behavior':18s}  {'MO':3s}"
+                   f"  {'Format':22s}  {'Resolution':12s}")
+            out.write(hdr + "\n")
+            out.write("  " + "-" * (len(hdr) - 2) + "\n")
+
+            # Group by IP
+            ip_groups = defaultdict(list)
+            for port in sorted(ip_configs.keys()):
+                cfg = ip_configs[port]
+                ip_groups[cfg.get('ip_group', port)].append(port)
+
+            for group_name in sorted(ip_groups.keys()):
+                ports = ip_groups[group_name]
+                for port in ports:
+                    cfg = ip_configs[port]
+                    d = cfg['dir']
+                    dir_label = 'WR' if d == 'W' else 'RD'
+                    bus = cfg['bus_byte']
+                    burst_len = 64 // bus
+                    ppc = cfg['ppc']
+                    bpp = cfg['bpp']
+                    plane = cfg['plane']
+                    clock = cfg['clock_mhz']
+                    access = cfg['access_type'].replace('-order', '')
+                    behavior = cfg['behavior'].replace('_', ' ')
+                    mo = cfg['req_mo']
+                    fmt = cfg['format']
+                    res = cfg['resolution']
+
+                    out.write(
+                        f"  {port:20s}  {group_name:12s}  {dir_label:3s}  {bus:3d}B"
+                        f"  {burst_len:2d}beat"
+                        f"  {ppc:3d}  {bpp:4d}  {plane:3d}"
+                        f"  {clock:4d}MHz"
+                        f"  {access:8s}  {behavior:18s}  {mo:3d}"
+                        f"  {fmt:22s}  {res[0]}x{res[1]}\n"
+                    )
+
+        # ====================================================================
+        #  Section 3: Tick-based Analysis (YAML mode only)
         # ====================================================================
         if is_yaml_mode:
             out.write("\n" + "=" * 80 + "\n")
@@ -130,23 +224,61 @@ def generate_summary(trace_file: str, output_file: str = 'dependency_summary.txt
                 out.write(f"  Total Transactions  : {len(transactions):,}\n")
                 if sim_duration > 0:
                     out.write(f"  Avg TX / tick       : {len(transactions) / sim_duration:.2f}\n")
+                    avg_bw_btick = total_bytes / sim_duration
                     out.write(f"  Avg Bandwidth       : "
-                              f"{total_bytes / sim_duration:.1f} B/tick\n")
+                              f"{avg_bw_btick:.1f} B/tick\n")
 
-            # ----- Per-IP bandwidth breakdown -----
-            out.write(f"\n[*] Per-IP Bandwidth Breakdown:\n")
+            # ----- Per-DMA bandwidth breakdown -----
+            out.write(f"\n[*] Per-DMA Bandwidth Breakdown:\n")
             out.write("-" * 80 + "\n")
-            for port in sorted(ip_txs.keys()):
-                txs = ip_txs[port]
-                port_bytes = sum(tx['bytes'] for tx in txs)
-                ticks = [tx['tick'] for tx in txs if tx['tick'] is not None]
-                if ticks:
-                    duration = max(ticks) - min(ticks) + 1
-                    bw = port_bytes / duration if duration > 0 else 0
-                    pct = (port_bytes / total_bytes * 100) if total_bytes > 0 else 0
-                    out.write(f"  {port:20s} : {bw:8.1f} B/tick  "
-                              f"({pct:5.1f}%)  "
-                              f"[{port_bytes / 1024 / 1024:.2f} MB]\n")
+
+            if ip_configs:
+                # Grouped by IP
+                bw_ip_groups = defaultdict(list)
+                for port in sorted(ip_txs.keys()):
+                    cfg = ip_configs.get(port, {})
+                    bw_ip_groups[cfg.get('ip_group', port)].append(port)
+
+                for group_name in sorted(bw_ip_groups.keys()):
+                    ports = bw_ip_groups[group_name]
+                    out.write(f"  [{group_name}]\n")
+                    group_bytes_total = 0
+                    for port in ports:
+                        txs = ip_txs[port]
+                        port_bytes = port_bytes_map[port]
+                        group_bytes_total += port_bytes
+                        ticks = [tx['tick'] for tx in txs if tx['tick'] is not None]
+                        if ticks:
+                            duration = max(ticks) - min(ticks) + 1
+                            bw = port_bytes / duration if duration > 0 else 0
+                            pct = (port_bytes / total_bytes * 100) if total_bytes > 0 else 0
+                            line = f"    {port:20s} : {bw:8.1f} B/tick  ({pct:5.1f}%)  [{port_bytes / 1024 / 1024:.2f} MB]"
+                            if clock_map and port in clock_map:
+                                mhz = clock_map[port]
+                                bw_gbs = bw * mhz / 1000.0
+                                line += f"  {bw_gbs:6.2f} GB/s @{mhz}MHz"
+                            out.write(line + "\n")
+                    # IP subtotal
+                    ip_pct = (group_bytes_total / total_bytes * 100) if total_bytes > 0 else 0
+                    out.write(
+                        f"    {'── Subtotal':20s} :                     "
+                        f"({ip_pct:5.1f}%)  [{group_bytes_total / 1024 / 1024:.2f} MB]\n\n"
+                    )
+            else:
+                for port in sorted(ip_txs.keys()):
+                    txs = ip_txs[port]
+                    port_bytes = port_bytes_map[port]
+                    ticks = [tx['tick'] for tx in txs if tx['tick'] is not None]
+                    if ticks:
+                        duration = max(ticks) - min(ticks) + 1
+                        bw = port_bytes / duration if duration > 0 else 0
+                        pct = (port_bytes / total_bytes * 100) if total_bytes > 0 else 0
+                        line = f"  {port:20s} : {bw:8.1f} B/tick  ({pct:5.1f}%)  [{port_bytes / 1024 / 1024:.2f} MB]"
+                        if clock_map and port in clock_map:
+                            mhz = clock_map[port]
+                            bw_gbs = bw * mhz / 1000.0
+                            line += f"  {bw_gbs:6.2f} GB/s @{mhz}MHz"
+                        out.write(line + "\n")
 
             # ----- Address range analysis -----
             out.write(f"\n[*] Address Ranges:\n")

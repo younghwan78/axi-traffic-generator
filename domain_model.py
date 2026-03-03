@@ -44,6 +44,7 @@ class AxiTransaction:
     plane: int = 0
     rw: str = "W"
     iova: Optional[int] = None
+    cache: str = "Normal"       # "Normal" or "SBWC_Alloc"
     
     def __str__(self) -> str:
         """
@@ -86,6 +87,10 @@ class AxiTransaction:
         # Add optional deadline
         if self.deadline:
             parts.append(f"deadline={self.deadline}")
+        
+        # Add cache attribute for SBWC
+        if self.cache and self.cache != "Normal":
+            parts.append(f"cache={self.cache}")
         
         return " ".join(parts)
     

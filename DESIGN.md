@@ -17,16 +17,21 @@
 │                     Configuration Layer                       │
 │  ┌──────────────────┐    ┌──────────────────────┐            │
 │  │ DMA_IP_Spec.yaml │    │    Scenario.yaml      │            │
+│  │ (IP group,       │    │ (Clock MHz, SBWC,     │            │
+│  │  Instances)      │    │  Dependencies)        │            │
 │  └────────┬─────────┘    └──────────┬───────────┘            │
 │           └────────────┬────────────┘                        │
 │                ┌───────┴───────┐                             │
 │                │ ConfigParser  │  ← Sanity Check             │
+│                │ (Instances    │    + Instance Expansion      │
+│                │  expansion)   │                             │
 │                └───────┬───────┘                             │
 ├──────────────────────────────────────────────────────────────┤
 │                     Model Layer                               │
 │  ┌──────────────────┐  ┌──────────────────┐                  │
 │  │ FormatDescriptor │  │  AxiTransaction   │                  │
-│  │ (PlaneInfo, BPP) │  │ (tick,plane,rw,..)│                  │
+│  │ (PlaneInfo, BPP) │  │ (tick,plane,rw,   │                  │
+│  │ + SbwcDescriptor │  │  cache)           │                  │
 │  └────────┬─────────┘  └──────────────────┘                  │
 ├──────────────────────────────────────────────────────────────┤
 │                     Generation Layer                          │
@@ -35,24 +40,28 @@
 │  │  ┌──────────────┐  ┌──────────────┐  ┌────────────┐   │  │
 │  │  │ 64B Chopper  │  │ RasterOrder  │  │  Z-Order   │   │  │
 │  │  └──────────────┘  │   Pattern    │  │  Pattern   │   │  │
-│  │                    └──────────────┘  └────────────┘   │  │
+│  │  ┌──────────────┐  └──────────────┘  └────────────┘   │  │
+│  │  │ SBWC Header/ │                                     │  │
+│  │  │ Payload Gen  │                                     │  │
+│  │  └──────────────┘                                     │  │
 │  └────────────────────────────┬───────────────────────────┘  │
 ├──────────────────────────────────────────────────────────────┤
 │                     Scheduling Layer                          │
 │  ┌──────────────────────────────────────────────────────┐    │
-│  │              VirtualTickScheduler                     │    │
+│  │          VirtualTickScheduler (clock-proportional)    │    │
 │  │  ┌────────────┐  ┌────────────┐  ┌──────────────┐   │    │
 │  │  │  DmaAgent  │  │ Scoreboard │  │  MockSMMU    │   │    │
 │  │  │  +Strategy │  │ (deps,     │  │ (IOVA→PA,    │   │    │
-│  │  │  (per task)│  │  progress) │  │  PTW inject) │   │    │
+│  │  │  +ClkAccum │  │  progress) │  │  PTW inject) │   │    │
 │  │  └────────────┘  └────────────┘  └──────────────┘   │    │
 │  └────────────────────────────┬──────────────────────────┘   │
 ├──────────────────────────────────────────────────────────────┤
 │                     Output Layer                              │
-│  ┌────────────────┐  ┌──────────────────────┐                │
-│  │   trace.txt    │  │  trace_summary.txt   │                │
-│  │  (tick-based)  │  │ (BW, addr, behavior) │                │
-│  └────────────────┘  └──────────────────────┘                │
+│  ┌────────────────┐  ┌──────────────────┐  ┌─────────────┐  │
+│  │   trace.txt    │  │ trace_summary.txt │  │ trace_bw    │  │
+│  │  (tick-based)  │  │ (IP-grouped BW,  │  │ .html       │  │
+│  │               │  │  DMA config)      │  │ (Plotly)    │  │
+│  └────────────────┘  └──────────────────┘  └─────────────┘  │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -62,7 +71,7 @@
 
 ### 1. config_parser.py
 
-**Purpose**: YAML Configuration Parser + Validation
+**Purpose**: YAML Configuration Parser + Validation + Instance Expansion
 
 #### Data Classes
 
@@ -71,17 +80,24 @@
 | `CoreSpec` | Dir, BusByte, PPC, BPP, Plane |
 | `CtrlSpec` | VOTF, Qurgent, req_MO |
 | `BufferSpec` | Fifo, CTS, AXID, HWAPG, FRO |
-| `DmaIpSpec` | Complete IP spec (Core + Access + Ctrl + Buffer) |
+| `DmaIpSpec` | Complete IP spec (Core + Access + Ctrl + Buffer + **ip_group**) |
 | `DependencyConfig` | wait_for, granularity, margin |
 | `BehaviorProfile` | type, pipeline_group, backpressure_source, block_size, flush_bytes |
-| `TaskConfig` | task_name, ip_name, clock, format, resolution, dependency, behavior |
-| `ScenarioConfig` | name, clock_domains, memory_policy, tasks |
+| `TaskConfig` | task_name, ip_name, clock (MHz), format, resolution, **sbwc_ratio**, dependency, behavior |
+| `ScenarioConfig` | name, memory_policy, tasks |
+
+#### Instance Expansion
+
+When `load_ip_spec()` encounters an entry with `Instances: [A, B, C]`, it:
+1. Clones the spec for each instance name
+2. Sets `ip_group` from the `IP` field (defaults to entry name)
+3. Removes the template entry — only expanded instances remain
 
 #### Sanity Check Validations
 
-1. Referenced IP exists in spec
+1. Referenced IP exists in spec (after instance expansion)
 2. AccessType is supported by the IP
-3. Clock domain is defined
+3. Clock frequency is a positive integer
 4. Dependency targets exist as task names
 5. Backpressure source exists as a task
 
@@ -89,11 +105,9 @@
 
 ### 2. format_descriptor.py
 
-**Purpose**: Image format database and per-plane geometry computation
+**Purpose**: Image format database, per-plane geometry, and SBWC layout computation
 
 #### FORMAT_DB
-
-Supported formats with sub-sampling metadata:
 
 | Format Family | Variants | Planes | Sub-sampling |
 |---------------|----------|--------|-------------|
@@ -103,19 +117,24 @@ Supported formats with sub-sampling metadata:
 | RGB | 8bit, 10bit, RGBA | 1 | None |
 | Bayer | 8/10/12bit | 1 | None |
 | RAW | - | 1 | None |
+| **SBWC YUV** | 420_8/10bit, 422_8bit | 2 | Same as base |
+| **SBWC Bayer** | 10/12bit | 1 | None |
 
-#### PlaneInfo Computation
+#### SBWC_BLOCK_DB
 
-```python
-ImageFormatDescriptor.get_plane_info("YUV420_8bit_2plane", 1920, 1080)
-# → [PlaneInfo(0, 1920, 1080, 1.0, stride=1920, total=2073600),   # Y
-#    PlaneInfo(1,  960,  540, 2.0, stride=1920, total=1036800)]    # UV
-```
+Format-specific block alignment for SBWC compression:
 
-Key properties:
-- `stride` = ceil(line_bytes / 64) × 64  (64B aligned)
-- UV plane: interleaved U+V → `bpp = bpp_component × 2`
-- Plane total = stride × height
+| Family | block_w | block_h | Usage |
+|--------|---------|---------|-------|
+| YUV | 32 | 4 | 32×4 pixel blocks |
+| Bayer | 256 | 1 | 256×1 pixel rows |
+
+#### SbwcDescriptor
+
+Computes SBWC memory layout:
+- **Header**: `ceil(W/block_w) × ceil(H/block_h) × 16B`, aligned to 32B
+- **Payload**: `original_bytes × comp_ratio`, aligned to 128B
+- Layout returns per-plane header/payload sizes for address allocation
 
 ---
 
@@ -136,27 +155,25 @@ class AxiTransaction:
     plane: int = 0             # Plane index (0=Y, 1=UV)
     rw: str = "W"              # Internal R/W flag
     iova: Optional[int]        # SMMU: pre-translation address
-    # Legacy fields: hint, dep, req_delay, deadline
+    cache: str = "Normal"      # "Normal" or "SBWC_Alloc"
 ```
 
 Output format:
 ```
-tick=5 id=1 port=CAM_ISP_WR_0 type=WriteNoSnoop address=0x80000000 bytes=64 burst=seq
+tick=5 id=1 port=CAM_ISP_WR_0 type=WriteNoSnoop address=0x80000000 bytes=64 burst=seq cache=SBWC_Alloc
 ```
 
 ---
 
 ### 4. generator.py
 
-**Purpose**: Transaction stream generation with 64B chopping and access patterns
+**Purpose**: Transaction stream generation with 64B chopping, access patterns, and SBWC
 
 #### 64B Boundary Chopper
 
 ```python
 chop_at_64b_boundary(addr=0x1030, size=64)
 # → [(0x1030, 16), (0x1040, 48)]
-# First chunk: 16B to reach next 64B boundary
-# Second chunk: remaining 48B within the next 64B boundary
 ```
 
 #### Access Patterns (Strategy Pattern)
@@ -166,65 +183,63 @@ chop_at_64b_boundary(addr=0x1030, size=64)
 | `RasterOrderPattern` | Line-by-line scan respecting stride | Sequential rows |
 | `ZOrderPattern` | Macro-tile scan (default 64×32) | Tiled blocks, linearized |
 
+#### SBWC Stream Generation
+
+When `sbwc_ratio > 0`:
+1. `_generate_sbwc_header_stream()` — 32B granularity sequential access, `cache=SBWC_Alloc`
+2. `_generate_sbwc_payload_stream()` — Compressed data, 64B max burst, `cache=SBWC_Alloc`
+3. Header and payload at separate 4KB-aligned addresses per plane
+
 #### Stream Generation Pipeline
 
 ```
-Task Config → get_plane_info() → per-plane:
-  AccessPattern.generate_addresses(plane, start_addr)
-    → yields (raw_addr, raw_size)
-      → chop_at_64b_boundary(raw_addr, raw_size)
-        → AxiTransaction(addr, chopped_size, plane=idx)
-          → Stream
+Task Config → SBWC check:
+  ├── SBWC ON:  SbwcDescriptor.get_layout() → per-plane:
+  │     Header stream (32B) + Payload stream (compressed)
+  │     All tagged cache=SBWC_Alloc
+  └── SBWC OFF: get_plane_info() → per-plane:
+        AccessPattern.generate_addresses(plane, start_addr)
+          → chop_at_64b_boundary → AxiTransaction → Stream
 ```
 
 ---
 
 ### 5. scheduler.py
 
-**Purpose**: Tick-based multi-agent simulation
+**Purpose**: Tick-based multi-agent simulation with clock-proportional scheduling
+
+#### Clock-Proportional Scheduling
+
+```python
+max_clock = max(agent.clock_mhz for agent in agents)
+
+for tick in range(max_ticks):
+    for agent in agents:
+        agent._clock_accum += agent.clock_mhz
+        if agent._clock_accum < max_clock:
+            continue                          # Skip: not this agent's turn
+        agent._clock_accum -= max_clock       # Step: agent's clock edge
+        txs = agent.step(tick, scoreboard)
+```
+
+Effect: 800MHz agent steps ~1.5× more often than 533MHz agent.
+
+#### DmaAgent
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `bytes_per_tick` | PPC × BPP/8 | Data generated per clock |
+| `clock_mhz` | Task config | Clock frequency for scheduling |
+| `bus_byte` | IP Spec | Bus width for burst threshold |
+| `req_mo` | IP Spec | Max Outstanding requests |
+| `_clock_accum` | Runtime | Clock accumulator for proportional scheduling |
 
 #### Scoreboard
-
-Tracks producer progress for consumer dependency gating:
 
 ```python
 scoreboard.update("ISP_Write", completed_line=540)
 scoreboard.can_proceed("ISP_Write", required_line=530, margin=10)  # → True
 ```
-
-#### DmaAgent
-
-Per-task simulation state:
-
-| Field | Source | Description |
-|-------|--------|-------------|
-| `bytes_per_tick` | PPC × BPP/8 | Data generated per clock |
-| `bus_byte` | IP Spec | Bus width for burst threshold |
-| `req_mo` | IP Spec | Max Outstanding requests |
-| `internal_buffer` | Accumulated | Virtual internal data buffer |
-| `stalled` | Runtime | Backpressure indicator |
-| `backpressure_source` | Scenario | Linked upstream agent |
-
-#### VirtualTickScheduler.run()
-
-```
-for tick in 0..max_ticks:
-    for agent in agents (round-robin):
-        if agent.finished: skip
-        if not dependency_satisfied: skip
-        txs = agent.strategy.step(tick, scoreboard)
-        if smmu.enabled: txs = apply_smmu(txs)
-        update scoreboard
-    if all finished: break
-```
-
-#### build_scheduler() Factory
-
-Wires everything together:
-1. Parse configs → generate per-plane transaction pools
-2. Select BehaviorStrategy per task
-3. Create DmaAgent per task
-4. Register all agents in scheduler
 
 ---
 
@@ -242,8 +257,6 @@ Each tick:
        emit next transaction, decrement buffer and MO
 ```
 
-Typical pattern: **Steady-stream** (1 tx per active tick)
-
 #### AccumulateAndFlushStrategy (Stat/Metadata DMA)
 
 ```
@@ -253,59 +266,48 @@ Each tick:
   3. If triggered: burst Flush_Bytes / 64 transactions at once
 ```
 
-Typical pattern: **Flush-burst** (4 tx per trigger, low duty cycle)
-
 ---
 
 ### 7. smmu_model.py
 
 **Purpose**: Mock IOVA → PA translation (optional, default disabled)
 
-#### PhysicalAddressPool
-
 | Mode | Behavior |
 |------|----------|
 | CMA | Contiguous pages from reserved region (0x4000_0000+) |
 | SG | Random pages from general pool (0x8000_0000+) |
 
-Decision: `random() < cma_ratio` → CMA, else SG
-
-#### MockSMMU.translate(iova, size)
-
-1. Split range into 4KB pages
-2. For each page: map if unmapped (CMA or SG)
-3. Track TLB: first access → `is_new_page=True`
-4. Return list of `TranslationResult(pa, size, is_new_page)`
-
-#### PTW Injection
-
-On TLB miss, a 64B `ReadNoSnoop` is injected before the actual transaction:
-
-```
-ptw_addr = PT_BASE + (page_num % 0x10000) × 64
-```
+PTW Injection: on TLB miss, 64B `ReadNoSnoop` injected before actual transaction.
 
 ---
 
 ### 8. gen_summary.py
 
-**Purpose**: Trace analysis + comprehensive report generation
+**Purpose**: Trace analysis + IP-grouped hierarchical report
 
-Auto-detects mode (tick-based YAML vs dep-based Legacy) and generates appropriate sections:
-
-**YAML Mode Sections**:
+All sections display data grouped by IP with subtotals:
 
 | Section | Content |
 |---------|---------|
-| IP Overview | TX count, data volume, tick range per IP |
+| IP Overview | TX count, data volume, tick range per DMA, IP subtotals |
+| DMA Config | IP group, Dir, BusByte, BurstLen, PPC, BPP, Clock, Format, SBWC |
 | Simulation Stats | Duration, avg TX/tick, avg bandwidth |
-| BW Breakdown | Per-IP B/tick, percentage, total MB |
-| Address Ranges | Start/end address, span per IP |
+| BW Breakdown | Per-DMA B/tick with IP subtotals, GB/s @MHz |
+| Address Ranges | Start/end address, span per DMA |
 | 64B Compliance | Boundary violation count |
-| Behavior Analysis | Pattern classification (Steady/Flush/Eager), burst stats, duty cycle |
+| Behavior Analysis | Pattern classification, burst stats, duty cycle |
 
-**Legacy Mode Sections**:
-- Dependency graph, intra-IP deps (outstanding, rate), inter-IP deps (OTF, M2M)
+---
+
+### 9. gen_bw_chart.py
+
+**Purpose**: Interactive HTML bandwidth chart using Plotly.js
+
+Two chart sections:
+1. **IP-Level BW** — DMA traffic summed per IP group, Read/Write separated
+2. **Per-DMA BW** — Individual DMA channel bandwidth over time
+
+Features: 1000-tick time bins, hover tooltips, zoom/pan, dark theme.
 
 ---
 
@@ -317,22 +319,25 @@ Auto-detects mode (tick-based YAML vs dep-based Legacy) and generates appropriat
 DMA_IP_Spec.yaml + Scenario.yaml
     │
     ▼
-ConfigParser.load_ip_spec() + load_scenario()
+ConfigParser.load_ip_spec()     ← Instance expansion (Instances → clones)
+ConfigParser.load_scenario()    ← Clock MHz, SBWC_Ratio parsing
     │
     ▼
 ConfigParser.sanity_check()
     │
     ▼
 build_scheduler()
-  ├── ImageFormatDescriptor.get_plane_info()
-  ├── StreamGenerator.generate_streams_for_task()  ← per-plane, 64B chopping
+  ├── ImageFormatDescriptor / SbwcDescriptor
+  ├── StreamGenerator.generate_streams_for_task()
+  │     ├── SBWC: header + payload streams (cache=SBWC_Alloc)
+  │     └── Normal: per-plane streams (64B chopping)
   ├── BehaviorStrategy selection (Eager / Accumulate)
-  ├── DmaAgent creation (per task)
+  ├── DmaAgent creation (per task, clock_mhz set)
   └── VirtualTickScheduler setup
     │
     ▼
 VirtualTickScheduler.run()
-  ├── Tick loop (round-robin agents)
+  ├── Clock-proportional accumulator gating
   ├── Dependency gating (Scoreboard)
   ├── Strategy.step() → transactions
   ├── MockSMMU.translate() (if enabled)
@@ -341,32 +346,8 @@ VirtualTickScheduler.run()
     ▼
 Assign sequential IDs → Export trace.txt
     │
-    ▼
-generate_summary() → trace_summary.txt
-```
-
-### Legacy CSV Mode Pipeline
-
-```
-ip_config.csv + dependency_config.csv
-    │
-    ▼
-AxiTrafficGenerator.load_ip_config()
-    │
-    ▼
-generate_streams() → per-IP Stream objects
-    │
-    ▼
-assign_transaction_ids()
-    │
-    ▼
-apply_intra_dependencies() (rate, outstanding)
-    │
-    ▼
-apply_inter_dependencies() (M2M, OTF)
-    │
-    ▼
-export_trace() → trace.txt + summary
+    ├── generate_summary() → trace_summary.txt (IP-grouped)
+    └── generate_bw_chart() → trace_bw.html (Plotly)
 ```
 
 ---
@@ -381,23 +362,39 @@ AXI protocol requires transactions not to cross 64-byte aligned boundaries.
 Input:  addr=0x1030, size=64
 Step 1: Next boundary = 0x1040
 Step 2: First chunk = (0x1030, 16)   ← fills to boundary
-Step 3: Remaining = 48 bytes
-Step 4: Second chunk = (0x1040, 48)  ← within next boundary
+Step 3: Second chunk = (0x1040, 48)  ← within next boundary
 Output: [(0x1030, 16), (0x1040, 48)]
 ```
 
-### Z-Order Tiling
-
-Tiles are laid out sequentially in memory (each tile = `tile_w × tile_h × bpp` bytes):
+### Clock-Proportional Scheduling
 
 ```
-Image: 1920×1080, Tile: 64×32
-tiles_x = ⌈1920/64⌉ = 30
-tiles_y = ⌈1080/32⌉ = 34
-Total tiles = 1020
+Agents: A (800MHz), B (533MHz)
+max_clock = 800
 
-Tile[ty][tx] base address = start + (ty × tiles_x + tx) × tile_bytes
-Within tile: sequential 64B reads/writes
+Tick 0: A.accum=800≥800 → step; B.accum=533<800 → skip
+Tick 1: A.accum=800≥800 → step; B.accum=1066≥800 → step (accum=266)
+Tick 2: A.accum=800≥800 → step; B.accum=799<800 → skip
+Tick 3: A.accum=800≥800 → step; B.accum=1332≥800 → step (accum=532)
+
+Ratio: A steps 4/4, B steps 2/4 = 50% → 533/800 ≈ 66.6% (converges over time)
+```
+
+### SBWC Header/Payload Layout
+
+```
+Per-plane memory layout (SBWC_YUV420_8bit, 3840×2160):
+
+Header region:
+  blocks_x = ceil(3840/32) = 120
+  blocks_y = ceil(2160/4)  = 540
+  header_size = 120 × 540 × 16B = 1,036,800B → 32B aligned
+
+Payload region (50% compression):
+  original = stride × height = 3840 × 2160 = 8,294,400B
+  payload = 8,294,400 × 0.5 = 4,147,200B → 128B aligned
+
+Total SBWC = header + payload ≈ 5.2MB (vs 7.9MB original = 34% saving)
 ```
 
 ### Behavior Strategy Selection
@@ -406,20 +403,6 @@ Within tile: sequential 64B reads/writes
 |----------------------|----------------|---------|
 | `Eager_MO_Burst` | `EagerMOStrategy` | Every tick (buffer ≥ BusByte) |
 | `Accumulate_and_Flush` | `AccumulateAndFlushStrategy` | Block_Size pixels processed |
-
-### Backpressure Propagation
-
-```
-ISP_Read.Backpressure_Source = "ISP_Write"
-
-Tick N:
-  ISP_Write.stalled = True (no buffer space)
-  → ISP_Read detects upstream stall → emits nothing
-  → ISP_Read.stalled = True
-
-Tick N+1:
-  ISP_Write resumes → ISP_Read resumes
-```
 
 ---
 
@@ -436,14 +419,14 @@ Dependency:
 
 Semantics: Consumer can process line `L` only when producer has completed line `L - margin`.
 
-### dep-Based (Legacy Mode)
+### Backpressure Propagation
 
-| Type | Format | Meaning |
-|------|--------|---------|
-| Intra-IP rate | `dep=N-1,req+128` | Wait 128 cycles after previous TX request |
-| Intra-IP outstanding | `dep=N-8,resp+0` | Wait for TX N-8 response |
-| Inter-IP OTF | `dep=K,req+0` | Wait for producer TX K request |
-| Inter-IP M2M | `dep=K,resp+200` | Wait for producer last TX response + 200 cycles |
+```
+ISP_Read.Backpressure_Source = "ISP_Write"
+
+Tick N:   ISP_Write.stalled → ISP_Read detects → emits nothing
+Tick N+1: ISP_Write resumes → ISP_Read resumes
+```
 
 ---
 

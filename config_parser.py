@@ -47,6 +47,7 @@ class DmaIpSpec:
     """Complete hardware specification for a single DMA IP."""
     name: str
     core: CoreSpec
+    ip_group: str = ""                  # IP group name (for hierarchical summary)
     access: List[str] = field(default_factory=lambda: ["raster-order"])
     ctrl: CtrlSpec = field(default_factory=CtrlSpec)
     buffer: BufferSpec = field(default_factory=BufferSpec)
@@ -79,10 +80,11 @@ class TaskConfig:
     """Single task (DMA job) within a scenario."""
     task_name: str
     ip_name: str
-    clock: str
+    clock: int                      # Clock frequency in MHz
     format: str
     resolution: List[int]       # [width, height]
     access_type: str = "raster-order"
+    sbwc_ratio: float = 0.0         # SBWC compression ratio (0 = off)
     dependency: List[DependencyConfig] = field(default_factory=list)
     behavior: BehaviorProfile = field(default_factory=BehaviorProfile)
 
@@ -97,7 +99,6 @@ class MemoryPolicy:
 class ScenarioConfig:
     """Complete scenario configuration."""
     name: str
-    clock_domains: Dict[str, int]   # domain_name -> MHz
     memory_policy: MemoryPolicy
     tasks: List[TaskConfig]
 
@@ -136,6 +137,7 @@ class ConfigParser:
             )
 
             access = ip_data.get('Access', ['raster-order'])
+            ip_group = ip_data.get('IP', ip_name)   # Default: entry name
 
             ctrl_raw = ip_data.get('Ctrl', {})
             ctrl = CtrlSpec(
@@ -155,13 +157,47 @@ class ConfigParser:
                 fro=buf_raw.get('FRO', 2),
             )
 
-            specs[ip_name] = DmaIpSpec(
-                name=ip_name,
-                core=core,
-                access=access,
-                ctrl=ctrl,
-                buffer=buffer,
-            )
+            instances = ip_data.get('Instances', None)
+
+            if instances:
+                # Template with Instances → clone for each instance name
+                for inst_name in instances:
+                    specs[inst_name] = DmaIpSpec(
+                        name=inst_name,
+                        core=CoreSpec(
+                            dir=core.dir,
+                            bus_byte=core.bus_byte,
+                            ppc=core.ppc,
+                            bpp=core.bpp,
+                            plane=core.plane,
+                        ),
+                        ip_group=ip_group,
+                        access=list(access),
+                        ctrl=CtrlSpec(
+                            votf=ctrl.votf,
+                            votf_stall=ctrl.votf_stall,
+                            qurgent=ctrl.qurgent,
+                            req_mo=ctrl.req_mo,
+                        ),
+                        buffer=BufferSpec(
+                            fifo=buffer.fifo,
+                            cts=buffer.cts,
+                            axid=buffer.axid,
+                            usr_w=buffer.usr_w,
+                            hwapg=buffer.hwapg,
+                            fro=buffer.fro,
+                        ),
+                    )
+            else:
+                # Single DMA entry (no Instances)
+                specs[ip_name] = DmaIpSpec(
+                    name=ip_name,
+                    core=core,
+                    ip_group=ip_group,
+                    access=access,
+                    ctrl=ctrl,
+                    buffer=buffer,
+                )
 
         return specs
 
@@ -182,9 +218,6 @@ class ConfigParser:
         # Scenario info
         info = raw.get('Scenario_Info', {})
         name = info.get('Name', 'Unnamed')
-
-        # Clock domains
-        clock_domains = raw.get('Clock_Domains', {})
 
         # Memory policy
         mem_raw = raw.get('Memory_Policy', {})
@@ -222,17 +255,17 @@ class ConfigParser:
             tasks.append(TaskConfig(
                 task_name=task_raw['TaskName'],
                 ip_name=task_raw['IP_Name'],
-                clock=task_raw.get('Clock', ''),
+                clock=int(task_raw.get('Clock', 800)),
                 format=task_raw.get('Format', ''),
                 resolution=task_raw.get('Resolution', [0, 0]),
                 access_type=task_raw.get('AccessType', 'raster-order'),
+                sbwc_ratio=float(task_raw.get('SBWC_Ratio', 0.0)),
                 dependency=deps,
                 behavior=behavior,
             ))
 
         return ScenarioConfig(
             name=name,
-            clock_domains=clock_domains,
             memory_policy=memory_policy,
             tasks=tasks,
         )
@@ -276,11 +309,10 @@ class ConfigParser:
                     f"(supported: {ip_spec.access})"
                 )
 
-            # 3. Clock domain exists
-            if task.clock and task.clock not in scenario.clock_domains:
+            # 3. Clock frequency valid
+            if task.clock <= 0:
                 errors.append(
-                    f"Task '{task.task_name}': Clock domain '{task.clock}' "
-                    f"not defined in Clock_Domains"
+                    f"Task '{task.task_name}': Clock frequency must be > 0 MHz"
                 )
 
             # 4. Dependency targets exist

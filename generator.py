@@ -5,6 +5,7 @@ Generates AXI transaction streams with:
   - 64B Boundary Chopping
   - Raster-order and Z-order access patterns
   - Per-plane stream generation (optional UV interleaving)
+  - SBWC (Samsung Bandwidth Compression) header/payload streams
 """
 
 from abc import ABC, abstractmethod
@@ -12,7 +13,7 @@ from math import ceil
 from typing import List, Tuple, Generator as Gen, Optional
 
 from domain_model import AxiTransaction
-from format_descriptor import ImageFormatDescriptor, PlaneInfo
+from format_descriptor import ImageFormatDescriptor, PlaneInfo, SbwcDescriptor
 
 
 # ============================================================================
@@ -85,7 +86,7 @@ def chop_at_64b_boundary(addr: int, requested_size: int) -> List[Tuple[int, int]
         requested_size: Requested transfer size in bytes
 
     Returns:
-        List of (address, size) tuples, each ≤ 64B and not crossing a boundary
+        List of (address, size) tuples, each <= 64B and not crossing a boundary
     """
     chunks: List[Tuple[int, int]] = []
     remaining = requested_size
@@ -191,7 +192,7 @@ class StreamGenerator:
     """
 
     # ------------------------------------------------------------------
-    #  Legacy interface (CSV mode – kept for backward compatibility)
+    #  Legacy interface (CSV mode - kept for backward compatibility)
     # ------------------------------------------------------------------
     @staticmethod
     def generate_stream(port: str, tx_type: str, start_addr: int,
@@ -200,39 +201,19 @@ class StreamGenerator:
                         llc_enable: bool = False, line_delay: int = 0) -> Stream:
         """
         Generate a stream of AXI transactions (legacy flat mode).
-
-        Args:
-            port: Port/IP name
-            tx_type: Transaction type ("ReadNoSnoop" or "WriteNoSnoop")
-            start_addr: Starting memory address
-            total_size: Total transfer size in bytes
-            burst_size: Size of each burst in bytes (default 64)
-            line_size: Size of one line in bytes (for OTF sync)
-            h_size: Horizontal pixel count
-            bpp: Bytes per pixel
-            llc_enable: Enable LLC allocation hint (default False)
-            line_delay: Initial line delay in cycles (default 0)
-
-        Returns:
-            Stream object containing transactions
         """
         transactions: List[AxiTransaction] = []
         current_addr = start_addr
         remaining_size = total_size
 
         while remaining_size > 0:
-            # Apply 64B boundary chopping
             transfer_size = min(burst_size, remaining_size)
             chopped = chop_at_64b_boundary(current_addr, transfer_size)
 
             for (addr, size) in chopped:
                 tx = AxiTransaction(
-                    id=0,
-                    port=port,
-                    type=tx_type,
-                    address=addr,
-                    bytes=size,
-                    burst="seq",
+                    id=0, port=port, type=tx_type,
+                    address=addr, bytes=size, burst="seq",
                     hint="LLC_ALLOC" if llc_enable else None,
                     rw="R" if "Read" in tx_type else "W",
                 )
@@ -246,7 +227,7 @@ class StreamGenerator:
         return Stream(port, transactions, line_size, h_size, bpp)
 
     # ------------------------------------------------------------------
-    #  New YAML-based interface
+    #  YAML-based: per-plane stream
     # ------------------------------------------------------------------
     @staticmethod
     def generate_plane_stream(port: str,
@@ -254,81 +235,157 @@ class StreamGenerator:
                               plane: PlaneInfo,
                               start_addr: int,
                               access_pattern: AccessPattern,
-                              plane_index: int = 0) -> Stream:
+                              plane_index: int = 0,
+                              cache: str = "Normal") -> Stream:
         """
         Generate a transaction stream for a single image plane.
 
         Applies 64B boundary chopping to every address chunk produced
         by the access pattern.
-
-        Args:
-            port: Port/IP name
-            tx_type: "ReadNoSnoop" or "WriteNoSnoop"
-            plane: PlaneInfo describing the plane geometry
-            start_addr: Base address for this plane
-            access_pattern: AccessPattern strategy (Raster / Z-order)
-            plane_index: Plane index (0=Y, 1=UV, ...)
-
-        Returns:
-            Stream with all chopped transactions
         """
         transactions: List[AxiTransaction] = []
         rw = "R" if "Read" in tx_type else "W"
 
         for (raw_addr, raw_size) in access_pattern.generate_addresses(plane, start_addr):
-            # Apply 64B boundary chopping
             for (addr, size) in chop_at_64b_boundary(raw_addr, raw_size):
                 tx = AxiTransaction(
-                    id=0,
-                    port=port,
-                    type=tx_type,
-                    address=addr,
-                    bytes=size,
-                    burst="seq",
-                    plane=plane_index,
-                    rw=rw,
+                    id=0, port=port, type=tx_type,
+                    address=addr, bytes=size, burst="seq",
+                    plane=plane_index, rw=rw, cache=cache,
                 )
                 transactions.append(tx)
 
         return Stream(
-            ip_name=port,
-            transactions=transactions,
-            line_size=plane.stride,
-            h_size=plane.width,
-            bpp=plane.bpp,
-            plane_index=plane_index,
+            ip_name=port, transactions=transactions,
+            line_size=plane.stride, h_size=plane.width,
+            bpp=plane.bpp, plane_index=plane_index,
         )
 
+    # ------------------------------------------------------------------
+    #  SBWC Header stream
+    # ------------------------------------------------------------------
     @staticmethod
-    def generate_streams_for_task(port: str,
-                                  tx_type: str,
-                                  format_str: str,
-                                  width: int,
-                                  height: int,
-                                  access_type: str,
-                                  base_addr: int,
-                                  tile_w: int = 64,
-                                  tile_h: int = 32) -> List[Stream]:
+    def _generate_sbwc_header_stream(port: str, tx_type: str,
+                                     header_size: int, start_addr: int,
+                                     plane_index: int = 0) -> Stream:
+        """
+        Generate sequential reads/writes for SBWC header region.
+        Header is accessed linearly (32B-aligned blocks of metadata).
+        """
+        transactions: List[AxiTransaction] = []
+        rw = "R" if "Read" in tx_type else "W"
+        remaining = header_size
+        addr = start_addr
+
+        while remaining > 0:
+            chunk = min(remaining, 32)  # Header granularity = 32B
+            for (ca, cs) in chop_at_64b_boundary(addr, chunk):
+                tx = AxiTransaction(
+                    id=0, port=port, type=tx_type,
+                    address=ca, bytes=cs, burst="seq",
+                    plane=plane_index, rw=rw, cache="SBWC_Alloc",
+                )
+                transactions.append(tx)
+            addr += chunk
+            remaining -= chunk
+
+        return Stream(ip_name=port, transactions=transactions,
+                      plane_index=plane_index)
+
+    # ------------------------------------------------------------------
+    #  SBWC Payload stream
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _generate_sbwc_payload_stream(port: str, tx_type: str,
+                                      payload_size: int, start_addr: int,
+                                      plane_index: int = 0) -> Stream:
+        """
+        Generate sequential reads/writes for SBWC payload region.
+        Payload is compressed data, accessed linearly (128B-aligned).
+        """
+        transactions: List[AxiTransaction] = []
+        rw = "R" if "Read" in tx_type else "W"
+        remaining = payload_size
+        addr = start_addr
+
+        while remaining > 0:
+            chunk = min(remaining, 64)  # Still 64B max AXI burst
+            for (ca, cs) in chop_at_64b_boundary(addr, chunk):
+                tx = AxiTransaction(
+                    id=0, port=port, type=tx_type,
+                    address=ca, bytes=cs, burst="seq",
+                    plane=plane_index, rw=rw, cache="SBWC_Alloc",
+                )
+                transactions.append(tx)
+            addr += chunk
+            remaining -= chunk
+
+        return Stream(ip_name=port, transactions=transactions,
+                      plane_index=plane_index)
+
+    # ------------------------------------------------------------------
+    #  Main entry: generate streams for a task
+    # ------------------------------------------------------------------
+    @staticmethod
+    def generate_streams_for_task(port: str, tx_type: str,
+                                  format_str: str, width: int, height: int,
+                                  access_type: str, base_addr: int,
+                                  tile_w: int = 64, tile_h: int = 32,
+                                  sbwc_ratio: float = 0.0) -> List[Stream]:
         """
         Generate one Stream per plane for a task (YAML mode).
 
-        For multi-plane formats (e.g. NV12) each plane gets its own
-        stream, treating each as an independent DMA channel.
+        When sbwc_ratio > 0 and format is SBWC, generates separate
+        header and payload streams per plane with cache='SBWC_Alloc'.
 
         Args:
             port: IP/port name
             tx_type: "ReadNoSnoop" or "WriteNoSnoop"
-            format_str: Format string (e.g. "YUV420_8bit_2plane")
+            format_str: Format string (e.g. "SBWC_YUV420_8bit")
             width: Image pixel width
             height: Image pixel height
             access_type: "raster-order" or "Z-order"
             base_addr: Starting memory address
             tile_w: Tile width for Z-order (default 64)
             tile_h: Tile height for Z-order (default 32)
+            sbwc_ratio: SBWC compression ratio (0 = off, 0.5 = 50%)
 
         Returns:
-            List of Stream objects (one per plane)
+            List of Stream objects
         """
+        # === SBWC mode ===
+        if sbwc_ratio > 0 and SbwcDescriptor.is_sbwc(format_str):
+            layout = SbwcDescriptor.get_layout(
+                format_str, width, height, sbwc_ratio)
+            streams: List[Stream] = []
+            addr = base_addr
+
+            for sp in layout['planes']:
+                plane = sp['plane_info']
+                hdr_size = sp['header_size']
+                pay_size = sp['payload_size']
+
+                # Header stream
+                hdr_stream = StreamGenerator._generate_sbwc_header_stream(
+                    port, tx_type, hdr_size, addr, plane.index)
+                streams.append(hdr_stream)
+                addr += hdr_size
+                remainder = addr % 4096
+                if remainder != 0:
+                    addr += (4096 - remainder)
+
+                # Payload stream
+                pay_stream = StreamGenerator._generate_sbwc_payload_stream(
+                    port, tx_type, pay_size, addr, plane.index)
+                streams.append(pay_stream)
+                addr += pay_size
+                remainder = addr % 4096
+                if remainder != 0:
+                    addr += (4096 - remainder)
+
+            return streams
+
+        # === Normal mode ===
         planes = ImageFormatDescriptor.get_plane_info(format_str, width, height)
         pattern = create_access_pattern(access_type, tile_w, tile_h)
         streams: List[Stream] = []
@@ -336,15 +393,11 @@ class StreamGenerator:
 
         for plane in planes:
             stream = StreamGenerator.generate_plane_stream(
-                port=port,
-                tx_type=tx_type,
-                plane=plane,
-                start_addr=addr,
-                access_pattern=pattern,
+                port=port, tx_type=tx_type, plane=plane,
+                start_addr=addr, access_pattern=pattern,
                 plane_index=plane.index,
             )
             streams.append(stream)
-            # Advance address for next plane (aligned to 4KB)
             addr += plane.total_bytes
             remainder = addr % 4096
             if remainder != 0:

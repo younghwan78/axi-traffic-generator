@@ -14,6 +14,7 @@ from utils import MultimediaUtils, AddressAllocator
 from generator import StreamGenerator, Stream
 from dependency import DependencyManager
 from gen_summary import generate_summary
+from gen_bw_chart import generate_bw_chart
 
 
 class AxiTrafficGenerator:
@@ -468,11 +469,43 @@ def run_yaml_mode(ip_spec_path: str, scenario_path: str,
     print(f"\n✓ AXI Traffic Generation Complete! ({len(all_transactions)} transactions)")
     print(f"  Trace: {output_path}")
 
+    # Build IP → clock frequency map for bandwidth calculation
+    ip_clock_map = {}
+    for task in scenario.tasks:
+        ip_clock_map[task.ip_name] = task.clock
+
+    # Build IP → config dict for DMA Configuration Summary
+    ip_configs = {}
+    for task in scenario.tasks:
+        ip_spec = specs[task.ip_name]
+        ip_configs[task.ip_name] = {
+            'dir': ip_spec.core.dir,
+            'bus_byte': ip_spec.core.bus_byte,
+            'ppc': ip_spec.core.ppc,
+            'bpp': ip_spec.core.bpp,
+            'plane': ip_spec.core.plane,
+            'clock_mhz': task.clock,
+            'access_type': task.access_type,
+            'behavior': task.behavior.type,
+            'req_mo': ip_spec.ctrl.req_mo,
+            'format': task.format,
+            'resolution': task.resolution,
+            'ip_group': ip_spec.ip_group,
+            'sbwc_ratio': task.sbwc_ratio,
+        }
+
     # Generate summary report
     summary_path = output_path.replace('.txt', '_summary.txt')
     print(f"\nGenerating summary report...")
-    generate_summary(output_path, summary_path)
+    generate_summary(output_path, summary_path,
+                     clock_map=ip_clock_map, ip_configs=ip_configs)
     print(f"  Summary: {summary_path}")
+
+    # Generate BW chart
+    chart_path = output_path.replace('.txt', '_bw.html')
+    generate_bw_chart(output_path, chart_path,
+                      ip_configs=ip_configs, clock_map=ip_clock_map)
+    print(f"  BW Chart: {chart_path}")
 
 
 def main():

@@ -1,22 +1,21 @@
-# Dynamic Scenario Configuration
-# 동적 유스케이스 정의 파일 - Clock, 해상도, Dependency, Behavior 등
+# SMMU-enabled Scenario Configuration
+# SMMU 활성화 + Z-order + 다양한 기능 검증용
 
 Scenario_Info:
-  Name: "4K_Camera_to_Display"
+  Name: "4K_Camera_SMMU_Enabled"
 
 Memory_Policy:
-  SMMU_Enable: false    # SMMU 활성화 여부 (default: false)
+  SMMU_Enable: true     # SMMU 활성화
   CMA_Ratio: 0.3        # 30%는 연속된 물리 메모리 할당
-  Page_Size: 4096        # 4KB
+  Page_Size: 4096       # 4KB
 
 Tasks:
   - TaskName: "ISP_Write_Y"
     IP_Name: "CAM_ISP_WR_0"
     Clock: 800            # MHz
-    Format: "SBWC_YUV420_8bit"
+    Format: "YUV420_8bit_2plane"
     Resolution: [3840, 2160]
-    AccessType: "raster-order"
-    SBWC_Ratio: 0.5       # 50% compression
+    AccessType: "Z-order"
     Dependency: []
     Behavior_Profile:
       Type: "Eager_MO_Burst"
@@ -25,10 +24,9 @@ Tasks:
   - TaskName: "ISP_Write_DS"
     IP_Name: "CAM_ISP_WR_1"
     Clock: 800            # MHz
-    Format: "SBWC_YUV420_8bit"
+    Format: "YUV420_8bit_2plane"
     Resolution: [1920, 1080]
     AccessType: "raster-order"
-    SBWC_Ratio: 0.5       # 50% compression
     Dependency: []
     Behavior_Profile:
       Type: "Eager_MO_Burst"
@@ -37,10 +35,9 @@ Tasks:
   - TaskName: "ISP_Read"
     IP_Name: "CAM_ISP_RD_0"
     Clock: 800            # MHz
-    Format: "SBWC_YUV420_8bit"
+    Format: "YUV420_8bit_2plane"
     Resolution: [3840, 2160]
     AccessType: "raster-order"
-    SBWC_Ratio: 0.5       # 50% compression
     Dependency: []
     Behavior_Profile:
       Type: "Eager_MO_Burst"
@@ -64,10 +61,9 @@ Tasks:
   - TaskName: "DISP_Read"
     IP_Name: "DISP_RD_0"
     Clock: 533            # MHz
-    Format: "SBWC_YUV420_8bit"
+    Format: "YUV420_8bit_2plane"
     Resolution: [3840, 2160]
     AccessType: "raster-order"
-    SBWC_Ratio: 0.5       # 50% compression
     Dependency:
       - Wait_For: "ISP_Write_Y"
         Granularity: "Line"

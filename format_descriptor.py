@@ -29,6 +29,13 @@ class PlaneInfo:
 # Each entry: bpp_y, bpp_uv (per UV pixel pair), planes, sub_h, sub_v
 #   sub_h: horizontal chroma sub-sampling factor (2 = 4:2:0/4:2:2)
 #   sub_v: vertical chroma sub-sampling factor   (2 = 4:2:0)
+#   sbwc=True entries also carry: base_format, comp_ratio
+
+# SBWC block alignment per format family
+SBWC_BLOCK_DB = {
+    "YUV":   {"block_w": 32,  "block_h": 4},
+    "Bayer": {"block_w": 256, "block_h": 1},
+}
 FORMAT_DB = {
     # YUV 4:2:0 ----------------------------------------------------------------
     "YUV420_8bit_2plane":  {"bpp_y": 1.0,  "bpp_uv": 1.0,  "planes": 2, "sub_h": 2, "sub_v": 2},
@@ -48,6 +55,12 @@ FORMAT_DB = {
     "Bayer_12bit": {"bpp_y": 1.5,  "planes": 1, "sub_h": 1, "sub_v": 1},
     # RAW (stat / metadata) ----------------------------------------------------
     "RAW": {"bpp_y": 1.0, "planes": 1, "sub_h": 1, "sub_v": 1},
+    # SBWC compressed formats --------------------------------------------------
+    "SBWC_YUV420_8bit":  {"bpp_y": 1.0,  "bpp_uv": 1.0,  "planes": 2, "sub_h": 2, "sub_v": 2, "sbwc": True, "base_format": "YUV420_8bit_2plane",  "sbwc_family": "YUV"},
+    "SBWC_YUV420_10bit": {"bpp_y": 1.25, "bpp_uv": 1.25, "planes": 2, "sub_h": 2, "sub_v": 2, "sbwc": True, "base_format": "YUV420_10bit_2plane", "sbwc_family": "YUV"},
+    "SBWC_YUV422_8bit":  {"bpp_y": 1.0,  "bpp_uv": 1.0,  "planes": 2, "sub_h": 2, "sub_v": 1, "sbwc": True, "base_format": "YUV422_8bit_2plane",  "sbwc_family": "YUV"},
+    "SBWC_Bayer_10bit":  {"bpp_y": 1.25, "planes": 1, "sub_h": 1, "sub_v": 1, "sbwc": True, "base_format": "Bayer_10bit", "sbwc_family": "Bayer"},
+    "SBWC_Bayer_12bit":  {"bpp_y": 1.5,  "planes": 1, "sub_h": 1, "sub_v": 1, "sbwc": True, "base_format": "Bayer_12bit", "sbwc_family": "Bayer"},
 }
 
 
@@ -195,3 +208,110 @@ class ImageFormatDescriptor:
         """
         planes = ImageFormatDescriptor.get_plane_info(format_str, width, height, stride_align)
         return sum(p.total_bytes for p in planes)
+
+
+class SbwcDescriptor:
+    """
+    SBWC (Samsung Bandwidth Compression) layout calculator.
+
+    Computes header and payload sizes for SBWC-compressed formats.
+    Header stores per-block compression metadata; payload stores
+    compressed pixel data.
+    """
+
+    # Header metadata bytes per block (fixed)
+    HEADER_BYTES_PER_BLOCK = 16
+    HEADER_ALIGN = 32       # Header region alignment
+    PAYLOAD_ALIGN = 128     # Payload region alignment
+
+    @staticmethod
+    def is_sbwc(format_str: str) -> bool:
+        """Check if a format string is SBWC."""
+        fmt = ImageFormatDescriptor.get_format_entry(format_str)
+        return fmt.get('sbwc', False)
+
+    @staticmethod
+    def get_block_config(format_str: str) -> dict:
+        """
+        Get SBWC block dimensions for a format.
+
+        Returns:
+            dict with block_w, block_h
+        """
+        fmt = ImageFormatDescriptor.get_format_entry(format_str)
+        family = fmt.get('sbwc_family', 'YUV')
+        return SBWC_BLOCK_DB.get(family, SBWC_BLOCK_DB['YUV'])
+
+    @staticmethod
+    def calculate_header_size(width: int, height: int,
+                              block_w: int, block_h: int) -> int:
+        """
+        Calculate header region size.
+
+        blocks = ceil(width/block_w) * ceil(height/block_h)
+        header_bytes = blocks * HEADER_BYTES_PER_BLOCK, aligned to 32B
+        """
+        blocks_x = ceil(width / block_w)
+        blocks_y = ceil(height / block_h)
+        raw_size = blocks_x * blocks_y * SbwcDescriptor.HEADER_BYTES_PER_BLOCK
+        return int(ceil(raw_size / SbwcDescriptor.HEADER_ALIGN)) * SbwcDescriptor.HEADER_ALIGN
+
+    @staticmethod
+    def calculate_payload_size(original_bytes: int,
+                               comp_ratio: float) -> int:
+        """
+        Calculate payload (compressed data) region size.
+
+        payload = original_bytes * comp_ratio, aligned to 128B
+        """
+        compressed = int(original_bytes * comp_ratio)
+        return int(ceil(compressed / SbwcDescriptor.PAYLOAD_ALIGN)) * SbwcDescriptor.PAYLOAD_ALIGN
+
+    @staticmethod
+    def get_layout(format_str: str, width: int, height: int,
+                   comp_ratio: float = 0.5,
+                   stride_align: int = 64) -> dict:
+        """
+        Compute full SBWC memory layout for all planes.
+
+        Returns dict with:
+          planes: list of {header_size, payload_size, block_w, block_h, plane_info}
+          total_header: total header bytes across all planes
+          total_payload: total payload bytes across all planes
+        """
+        planes_info = ImageFormatDescriptor.get_plane_info(format_str, width, height, stride_align)
+        block_cfg = SbwcDescriptor.get_block_config(format_str)
+        block_w = block_cfg['block_w']
+        block_h = block_cfg['block_h']
+
+        result_planes = []
+        total_header = 0
+        total_payload = 0
+
+        for plane in planes_info:
+            # For chroma planes, block dimensions scale with sub-sampling
+            pw = block_w if plane.index == 0 else block_w
+            ph = block_h if plane.index == 0 else block_h
+
+            hdr_size = SbwcDescriptor.calculate_header_size(
+                plane.width, plane.height, pw, ph)
+            pay_size = SbwcDescriptor.calculate_payload_size(
+                plane.total_bytes, comp_ratio)
+
+            result_planes.append({
+                'plane_info': plane,
+                'header_size': hdr_size,
+                'payload_size': pay_size,
+                'block_w': pw,
+                'block_h': ph,
+            })
+            total_header += hdr_size
+            total_payload += pay_size
+
+        return {
+            'planes': result_planes,
+            'total_header': total_header,
+            'total_payload': total_payload,
+            'block_w': block_w,
+            'block_h': block_h,
+        }
