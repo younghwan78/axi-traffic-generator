@@ -74,6 +74,7 @@ class BehaviorProfile:
     trigger_unit: Optional[str] = None
     block_size: Optional[List[int]] = None
     flush_bytes: Optional[int] = None
+    progress_source: Optional[str] = None  # Track specific producer task's pixels
 
 @dataclass
 class TaskConfig:
@@ -250,6 +251,7 @@ class ConfigParser:
                 trigger_unit=bp_raw.get('Trigger_Unit'),
                 block_size=bp_raw.get('Block_Size'),
                 flush_bytes=bp_raw.get('Flush_Bytes'),
+                progress_source=bp_raw.get('Progress_Source'),
             )
 
             tasks.append(TaskConfig(

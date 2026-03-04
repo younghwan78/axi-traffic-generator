@@ -57,6 +57,7 @@ Tasks:
       Block_Size: [64, 64]
       Flush_Bytes: 256
       Pipeline_Group: "CAM_FE_PIPE"
+      Progress_Source: "ISP_Write_Y"
 
   - TaskName: "DISP_Read"
     IP_Name: "DISP_RD_0"

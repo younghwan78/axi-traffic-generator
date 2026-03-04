@@ -37,6 +37,7 @@ class Scoreboard:
     def __init__(self):
         self.completed_units: Dict[str, int] = {}   # task_name → line/tile #
         self.pixel_progress: Dict[str, int] = {}    # pipeline_group → pixels
+        self.task_pixels: Dict[str, int] = {}        # task_name → pixels
 
     def update(self, task_name: str, completed_unit: int) -> None:
         """Record that *task_name* has completed up to *completed_unit*."""
@@ -44,11 +45,16 @@ class Scoreboard:
             self.completed_units.get(task_name, 0), completed_unit
         )
 
-    def update_pixels(self, pipeline_group: str, pixels: int) -> None:
-        """Accumulate processed pixels for a pipeline group."""
+    def update_pixels(self, pipeline_group: str, pixels: int,
+                      task_name: str = "") -> None:
+        """Accumulate processed pixels for a pipeline group and task."""
         self.pixel_progress[pipeline_group] = (
             self.pixel_progress.get(pipeline_group, 0) + pixels
         )
+        if task_name:
+            self.task_pixels[task_name] = (
+                self.task_pixels.get(task_name, 0) + pixels
+            )
 
     def can_proceed(self, wait_for: str, required_unit: int,
                     margin: int = 0) -> bool:
@@ -64,6 +70,10 @@ class Scoreboard:
     def get_progress(self, pipeline_group: str) -> int:
         """Return total processed pixels for a pipeline group."""
         return self.pixel_progress.get(pipeline_group, 0)
+
+    def get_task_progress(self, task_name: str) -> int:
+        """Return total processed pixels for a specific task."""
+        return self.task_pixels.get(task_name, 0)
 
 
 # ============================================================================
@@ -100,6 +110,18 @@ class DmaAgent:
         self.internal_buffer: float = 0.0
         self.stalled: bool = False
         self.finished: bool = False
+        self.tx_finished: bool = False  # Transaction pool exhausted
+
+        # Total frame pixels for pixel progress tracking
+        self.total_frame_pixels: int = task.resolution[0] * task.resolution[1]
+
+        # Line progress tracking for dependency gating
+        from format_descriptor import ImageFormatDescriptor
+        planes = ImageFormatDescriptor.get_plane_info(
+            task.format, task.resolution[0], task.resolution[1])
+        self.stride: int = planes[0].stride if planes else (task.resolution[0])
+        self._bytes_emitted: int = 0
+        self._line_progress: int = 0  # Current image line (bytes_emitted / stride)
 
         # Bandwidth weight for scheduler (bytes/tick proportional)
         self.bandwidth = clock_mhz * self.ppc * self.bpp_bytes
@@ -130,7 +152,7 @@ class DmaAgent:
         while remaining > 0:
             tx = self.next_transaction()
             if tx is None:
-                self.finished = True
+                self.tx_finished = True
                 break
             tx.tick = tick
             chunk = min(remaining, tx.bytes)
@@ -141,7 +163,7 @@ class DmaAgent:
 
     def step(self, tick: int, scoreboard: Scoreboard) -> List[AxiTransaction]:
         """Delegate one tick to the behavior strategy."""
-        if self.finished:
+        if self.tx_finished:
             return []
         return self.strategy.step(self, tick, scoreboard)
 
@@ -184,17 +206,30 @@ class VirtualTickScheduler:
         """
         Check whether *agent* can proceed given its dependencies.
 
+        - Frame granularity: consumer waits until producer finishes
+          the entire frame (tx_finished).
+        - Line granularity: consumer can process line N only if
+          producer has completed at least line (N + margin).
+
         Returns True if all dependencies are satisfied.
         """
         for dep in agent.task.dependency:
             if not dep.wait_for:
                 continue
-            # Determine required unit based on agent's current progress
-            required = agent._lines_emitted
-            if not self.scoreboard.can_proceed(
-                dep.wait_for, required, dep.margin
-            ):
-                return False
+            producer = self.agents.get(dep.wait_for)
+            if producer is None:
+                continue
+
+            if dep.granularity == 'Frame':
+                # Frame sync: producer must finish entirely
+                if not producer.tx_finished:
+                    return False
+            else:
+                # Line sync: producer must be 'margin' lines ahead
+                consumer_line = agent._line_progress
+                required = consumer_line + dep.margin
+                if producer._line_progress < required:
+                    return False
         return True
 
     def run(self, max_ticks: int = 10_000_000) -> List[AxiTransaction]:
@@ -247,15 +282,28 @@ class VirtualTickScheduler:
 
                 all_transactions.extend(txs)
 
-                # Update scoreboard
-                if txs:
-                    agent._lines_emitted += len(txs)
-                    pixels = sum(t.bytes for t in txs) / max(agent.bpp_bytes, 0.1)
-                    agent._pixels_processed += int(pixels)
-                    self.scoreboard.update(agent.name, agent._lines_emitted)
+                # Update scoreboard: pixel progress every scheduled tick
+                # (ISP processes PPC pixels per clock regardless of emission)
+                if agent._pixels_processed < agent.total_frame_pixels:
+                    pixels = min(agent.ppc,
+                                 agent.total_frame_pixels - agent._pixels_processed)
+                    agent._pixels_processed += pixels
                     pg = agent.task.behavior.pipeline_group
                     if pg:
-                        self.scoreboard.update_pixels(pg, int(pixels))
+                        self.scoreboard.update_pixels(
+                            pg, pixels, task_name=agent.name)
+
+                # Update line/unit tracking only on actual emissions
+                if txs:
+                    agent._lines_emitted += len(txs)
+                    tx_bytes = sum(t.bytes for t in txs)
+                    agent._bytes_emitted += tx_bytes
+                    agent._line_progress = agent._bytes_emitted // agent.stride
+                    self.scoreboard.update(agent.name, agent._line_progress)
+
+                # Mark finished when both: tx pool exhausted AND all pixels counted
+                if agent.tx_finished and agent._pixels_processed >= agent.total_frame_pixels:
+                    agent.finished = True
 
             if not any_active:
                 break
@@ -364,7 +412,23 @@ def build_scheduler(specs: Dict[str, DmaIpSpec],
                 block_size=bp.block_size,
                 flush_bytes=bp.flush_bytes or 256,
                 pipeline_group=bp.pipeline_group,
+                progress_source=bp.progress_source,
             )
+            # Limit transaction pool to actual needed size
+            block_w = bp.block_size[0] if bp.block_size else 64
+            block_h = bp.block_size[1] if bp.block_size else 64
+            num_blocks = ((task.resolution[0] + block_w - 1) // block_w) * \
+                         ((task.resolution[1] + block_h - 1) // block_h)
+            max_bytes = num_blocks * (bp.flush_bytes or 256)
+            # Trim pool to needed size
+            trimmed: List[AxiTransaction] = []
+            acc = 0
+            for tx in all_txs:
+                if acc >= max_bytes:
+                    break
+                trimmed.append(tx)
+                acc += tx.bytes
+            all_txs = trimmed
         else:
             # Default: Eager_MO_Burst
             strategy = EagerMOStrategy()

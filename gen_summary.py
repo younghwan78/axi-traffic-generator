@@ -15,7 +15,8 @@ from typing import Dict, List, Optional
 
 def generate_summary(trace_file: str, output_file: str = 'dependency_summary.txt',
                      clock_map: Optional[Dict[str, int]] = None,
-                     ip_configs: Optional[Dict[str, Dict]] = None) -> None:
+                     ip_configs: Optional[Dict[str, Dict]] = None,
+                     scenario=None) -> None:
     """
     Generate comprehensive summary from trace file.
     Auto-detects YAML mode (tick=...) vs legacy mode (dep=...).
@@ -343,135 +344,161 @@ def generate_summary(trace_file: str, output_file: str = 'dependency_summary.txt
                 )
 
         # ====================================================================
-        #  Section 3: Dependency Analysis (legacy or hybrid)
+        #  Section: Traffic Verification (YAML mode only)
         # ====================================================================
-        has_deps = any(tx['deps'] for tx in transactions)
+        if ip_configs and is_yaml_mode:
+            from format_descriptor import ImageFormatDescriptor, SbwcDescriptor
+            from math import ceil as _ceil
 
-        if has_deps:
-            # Dependency Graph
             out.write("\n" + "=" * 80 + "\n")
-            out.write("DEPENDENCY ANALYSIS\n")
+            out.write("TRAFFIC VERIFICATION\n")
             out.write("=" * 80 + "\n")
+            out.write("  Compares actual trace data against theoretical expectations.\n\n")
 
-            out.write("\n[*] Dependency Graph:\n")
-            out.write("-" * 80 + "\n")
-
-            inter_deps = defaultdict(list)
-            for tx in transactions:
-                port = tx['port']
-                for target_id, event, offset in tx['deps']:
-                    target_port = None
-                    for p, (min_id, max_id) in ip_ranges.items():
-                        if min_id <= target_id <= max_id:
-                            target_port = p
-                            break
-                    if target_port and target_port != port:
-                        inter_deps[(target_port, port)].append({
-                            'consumer_id': tx['id'],
-                            'producer_id': target_id,
-                            'event': event,
-                            'offset': offset,
-                        })
-
-            graph_edges = {}
-            for (producer, consumer), deps in inter_deps.items():
-                graph_edges[(producer, consumer)] = "M2M" if len(deps) == 1 else "OTF"
-
-            if graph_edges:
-                all_consumers = set(c for _, c in graph_edges.keys())
-                all_producers = set(p for p, _ in graph_edges.keys())
-                all_nodes = all_consumers | all_producers
-                independent_nodes = all_nodes - all_consumers
-
-                adjacency = defaultdict(list)
-                for (producer, consumer), sync_type in graph_edges.items():
-                    adjacency[producer].append((consumer, sync_type))
-
-                visited = set()
-
-                def print_chain(node, indent="  "):
-                    if node in visited:
-                        return
-                    visited.add(node)
-                    if node in adjacency:
-                        for consumer, sync_type in sorted(adjacency[node]):
-                            arrow = "=>" if sync_type == "M2M" else "->"
-                            out.write(f"{indent}{node} {arrow} {consumer} ({sync_type})\n")
-                            print_chain(consumer, indent + "  ")
-
-                for node in sorted(independent_nodes):
-                    print_chain(node)
-                for node in sorted(all_nodes):
-                    if node not in visited:
-                        print_chain(node)
-            else:
-                out.write("  No inter-IP dependencies\n")
-
-            # Intra-IP Dependencies
-            out.write("\n" + "=" * 80 + "\n")
-            out.write("INTRA-IP DEPENDENCIES (Internal Control)\n")
-            out.write("=" * 80 + "\n")
+            all_pass = True
 
             for port in sorted(ip_txs.keys()):
-                out.write(f"\n[>] {port}\n")
-                out.write("-" * 80 + "\n")
+                cfg = ip_configs.get(port, {})
+                txs = ip_txs[port]
+                actual_bytes = port_bytes_map[port]
+                actual_count = len(txs)
+                ticks = [tx['tick'] for tx in txs if tx['tick'] is not None]
 
-                outstanding_deps = []
-                rate_deps = []
-                for tx in ip_txs[port]:
-                    for target_id, event, offset in tx['deps']:
-                        if ip_ranges[port][0] <= target_id <= ip_ranges[port][1]:
-                            if event == 'resp' and offset == 0:
-                                outstanding_deps.append((tx['id'], target_id))
-                            elif event == 'req' and offset > 0:
-                                rate_deps.append((tx['id'], target_id, offset))
+                fmt_str = cfg.get('format', '')
+                res = cfg.get('resolution', [0, 0])
+                width, height = res[0], res[1]
+                behavior = cfg.get('behavior', 'Eager_MO_Burst')
+                sbwc_ratio = cfg.get('sbwc_ratio', 0.0)
 
-                if outstanding_deps:
-                    interval = outstanding_deps[0][0] - outstanding_deps[0][1]
-                    out.write(f"  Outstanding Limit:\n    Active (interval = {interval})\n")
-                    out.write(f"    Examples:\n")
-                    for tx_id, target_id in outstanding_deps[:3]:
-                        out.write(f"      TX {tx_id:6d} -> depends on TX {target_id:6d} response\n")
-                    if len(outstanding_deps) > 3:
-                        out.write(f"      ... ({len(outstanding_deps)} total)\n")
+                # ---- Calculate expected bytes ----
+                expected_bytes = 0
+                derivation = ""
+
+                if behavior == 'Accumulate_and_Flush':
+                    # Stat DMA: (total_pixels / block_pixels) * flush_bytes
+                    bp_raw = cfg.get('_behavior_profile', {})
+                    block_size_w = 64
+                    block_size_h = 64
+                    flush_bytes = 256
+                    # Try to get from scenario config
+                    for task in (scenario.tasks if scenario else []):
+                        if task.ip_name == port:
+                            if task.behavior.block_size:
+                                block_size_w = task.behavior.block_size[0]
+                                block_size_h = task.behavior.block_size[1]
+                            if task.behavior.flush_bytes:
+                                flush_bytes = task.behavior.flush_bytes
+                            break
+
+                    total_pixels = width * height
+                    block_pixels = block_size_w * block_size_h
+                    num_flushes = total_pixels // block_pixels
+                    expected_bytes = num_flushes * flush_bytes
+                    derivation = (
+                        f"({width}x{height}) / ({block_size_w}x{block_size_h})"
+                        f" * {flush_bytes}B = {num_flushes} blocks * {flush_bytes}B"
+                    )
+                elif sbwc_ratio > 0 and SbwcDescriptor.is_sbwc(fmt_str):
+                    # SBWC format
+                    layout = SbwcDescriptor.get_layout(
+                        fmt_str, width, height, sbwc_ratio)
+                    expected_bytes = layout['total_header'] + layout['total_payload']
+                    parts = []
+                    for sp in layout['planes']:
+                        pi = sp['plane_info']
+                        plane_label = ['Y', 'UV', 'V'][pi.index] if pi.index < 3 else f'P{pi.index}'
+                        parts.append(f"hdr_{plane_label}={sp['header_size']:,}")
+                        parts.append(f"pay_{plane_label}={sp['payload_size']:,}")
+                    derivation = f"SBWC({' + '.join(parts)})"
                 else:
-                    out.write(f"  Outstanding Limit: None\n")
+                    # Normal format
+                    expected_bytes = ImageFormatDescriptor.get_total_size(
+                        fmt_str, width, height)
+                    planes = ImageFormatDescriptor.get_plane_info(
+                        fmt_str, width, height)
+                    parts = []
+                    for p in planes:
+                        plane_label = ['Y', 'UV', 'V'][p.index] if p.index < 3 else f'P{p.index}'
+                        parts.append(f"{plane_label}={p.stride}*{p.height}={p.total_bytes:,}")
+                    derivation = " + ".join(parts)
 
-                if rate_deps:
-                    delay = rate_deps[0][2]
-                    out.write(f"  Rate Limiting:\n    Active (delay = {delay} cycles)\n")
-                    out.write(f"    Examples:\n")
-                    for tx_id, target_id, d in rate_deps[:3]:
-                        out.write(f"      TX {tx_id:6d} -> depends on TX {target_id:6d} request + {d} cycles\n")
-                    if len(rate_deps) > 3:
-                        out.write(f"      ... ({len(rate_deps)} total)\n")
+                # ---- Burst pattern analysis ----
+                tick_groups = defaultdict(int)
+                tick_bytes_groups = defaultdict(int)
+                for tx in txs:
+                    if tx['tick'] is not None:
+                        tick_groups[tx['tick']] += 1
+                        tick_bytes_groups[tx['tick']] += tx['bytes']
+
+                sorted_burst_ticks = sorted(tick_groups.keys())
+                active_ticks = len(sorted_burst_ticks)
+                max_burst = max(tick_groups.values()) if tick_groups else 0
+                avg_burst = actual_count / active_ticks if active_ticks else 0
+
+                # Calculate average gap
+                avg_gap = 0.0
+                if len(sorted_burst_ticks) > 1:
+                    gaps = [sorted_burst_ticks[i+1] - sorted_burst_ticks[i]
+                            for i in range(len(sorted_burst_ticks)-1)]
+                    avg_gap = sum(gaps) / len(gaps)
+
+                # ---- Compare ----
+                match = actual_bytes == expected_bytes
+                ratio = actual_bytes / expected_bytes if expected_bytes > 0 else 0.0
+
+                # Check if agent was still active at simulation end
+                # (incomplete due to time limit, not calculation error)
+                sim_max_tick = max(all_ticks) if all_ticks else 0
+                agent_max_tick = max(ticks) if ticks else 0
+                near_end = (sim_max_tick - agent_max_tick) < 100  # within 100 ticks of sim end
+
+                if match:
+                    status = "PASS"
+                elif not match and near_end and ratio > 0.95:
+                    status = "INCOMPLETE"  # Hit simulation time limit
                 else:
-                    out.write(f"  Rate Limiting: None\n")
+                    status = "FAIL"
+                    all_pass = False
 
-            # Inter-IP Details
-            if inter_deps:
-                out.write("\n" + "=" * 80 + "\n")
-                out.write("INTER-IP DEPENDENCIES (IP Synchronization)\n")
-                out.write("=" * 80 + "\n")
+                rw = 'WR' if cfg.get('dir', 'R') == 'W' else 'RD'
+                group = cfg.get('ip_group', port)
 
-                for (producer, consumer), deps in sorted(inter_deps.items()):
-                    out.write(f"\n[>] {producer} -> {consumer}\n")
-                    out.write("-" * 80 + "\n")
-                    sample = deps[0]
-                    if len(deps) == 1:
-                        out.write(f"  Sync Type: M2M (Memory-to-Memory / Frame Sync)\n")
-                        out.write(f"  Consumer's first TX depends on Producer's last TX:\n")
-                        out.write(f"    TX {sample['consumer_id']:6d} -> depends on "
-                                  f"TX {sample['producer_id']:6d} {sample['event']}+{sample['offset']}\n")
-                    else:
-                        out.write(f"  Sync Type: OTF (On-The-Fly / Line Sync)\n")
-                        out.write(f"  Line-by-line synchronization (delay = {sample['offset']} cycles)\n")
-                        out.write(f"  Examples:\n")
-                        for dep in deps[:5]:
-                            out.write(f"    Consumer TX {dep['consumer_id']:6d} -> "
-                                      f"Producer TX {dep['producer_id']:6d} {dep['event']}+{dep['offset']}\n")
-                        if len(deps) > 5:
-                            out.write(f"    ... ({len(deps)} total line syncs)\n")
+                out.write(f"  [{port}] ({group}, {rw})\n")
+                out.write(f"  {'-' * 76}\n")
+                out.write(f"    Format     : {fmt_str} {width}x{height}")
+                if sbwc_ratio > 0:
+                    out.write(f" (SBWC ratio={sbwc_ratio})")
+                out.write("\n")
+                out.write(f"    Behavior   : {behavior}\n")
+                out.write(f"    Expected   : {expected_bytes:>12,} bytes  ({expected_bytes/1024:.1f} KB)\n")
+                out.write(f"    Actual     : {actual_bytes:>12,} bytes  ({actual_bytes/1024:.1f} KB)\n")
+                out.write(f"    Status     : {status}")
+                if status == "INCOMPLETE":
+                    out.write(f"  ({ratio:.1%}, simulation time limit)")
+                elif status == "FAIL":
+                    out.write(f"  (ratio={ratio:.4f})")
+                out.write("\n")
+                out.write(f"    Derivation : {derivation}\n")
+                out.write(f"    Burst      : avg={avg_burst:.1f} tx/burst, "
+                          f"max={max_burst}, active_ticks={active_ticks:,}")
+                if avg_gap > 0:
+                    out.write(f", avg_gap={avg_gap:.1f} ticks")
+                out.write("\n")
+
+                # For Accumulate_and_Flush, show extra details
+                if behavior == 'Accumulate_and_Flush' and ticks:
+                    avg_bytes_per_burst = actual_bytes / active_ticks if active_ticks else 0
+                    out.write(f"    Flush      : {active_ticks:,} flushes x "
+                              f"{avg_bytes_per_burst:.0f}B = {actual_bytes:,} bytes\n")
+                out.write("\n")
+
+            # Summary
+            out.write(f"  {'=' * 76}\n")
+            if all_pass:
+                out.write(f"  RESULT: ALL {len(ip_txs)} DMA CHANNELS VERIFIED SUCCESSFULLY\n")
+            else:
+                out.write(f"  RESULT: SOME DMA CHANNELS FAILED VERIFICATION\n")
+            out.write(f"  {'=' * 76}\n")
 
         out.write("\n" + "=" * 80 + "\n")
         out.write("END OF REPORT\n")

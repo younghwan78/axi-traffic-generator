@@ -60,6 +60,7 @@ Tasks:
       Block_Size: [64, 64]
       Flush_Bytes: 256
       Pipeline_Group: "CAM_FE_PIPE"
+      Progress_Source: "ISP_Write_Y"  # Track specific producer's pixels
 
   - TaskName: "DISP_Read"
     IP_Name: "DISP_RD_0"
@@ -75,3 +76,19 @@ Tasks:
     Behavior_Profile:
       Type: "Eager_MO_Burst"
       Pipeline_Group: "DPU_PIPE"
+
+  # Frame-level dependency example:
+  # M2M post-processing reads ISP output AFTER entire frame is written
+  - TaskName: "M2M_Read"
+    IP_Name: "M2M_RD_0"
+    Clock: 533            # MHz
+    Format: "YUV420_8bit_2plane"
+    Resolution: [3840, 2160]
+    AccessType: "raster-order"
+    Dependency:
+      - Wait_For: "ISP_Write_Y"
+        Granularity: "Frame"      # Wait for entire frame completion
+        Margin: 0
+    Behavior_Profile:
+      Type: "Eager_MO_Burst"
+      Pipeline_Group: "M2M_PIPE"

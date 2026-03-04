@@ -498,7 +498,8 @@ def run_yaml_mode(ip_spec_path: str, scenario_path: str,
     summary_path = output_path.replace('.txt', '_summary.txt')
     print(f"\nGenerating summary report...")
     generate_summary(output_path, summary_path,
-                     clock_map=ip_clock_map, ip_configs=ip_configs)
+                     clock_map=ip_clock_map, ip_configs=ip_configs,
+                     scenario=scenario)
     print(f"  Summary: {summary_path}")
 
     # Generate BW chart

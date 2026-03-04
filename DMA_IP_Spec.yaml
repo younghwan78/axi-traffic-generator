@@ -29,3 +29,10 @@ DISP_RD_0:
   Access: [ raster-order ]
   Ctrl:   { VOTF: false, VOTF_stall: false, Qurgent: false, req_MO: 4 }
   Buffer: { Fifo: 1024, CTS: 128, AXID: 4, usr_w: 8, HWAPG: true, FRO: 2 }
+
+M2M_RD_0:
+  IP: M2M
+  Core:   { Dir: R, BusByte: 16, PPC: 2, BPP: 12, Plane: 1 }
+  Access: [ raster-order ]
+  Ctrl:   { VOTF: false, VOTF_stall: false, Qurgent: false, req_MO: 4 }
+  Buffer: { Fifo: 1024, CTS: 128, AXID: 4, usr_w: 8, HWAPG: false, FRO: 2 }

@@ -68,7 +68,7 @@ class EagerMOStrategy(BehaviorStrategy):
         while agent.internal_buffer >= agent.bus_byte and mo_remaining > 0:
             tx = agent.next_transaction()
             if tx is None:
-                agent.finished = True
+                agent.tx_finished = True
                 break
             tx.tick = tick
             transactions.append(tx)
@@ -92,22 +92,31 @@ class AccumulateAndFlushStrategy(BehaviorStrategy):
     Monitors the pipeline progress via Scoreboard.  When enough pixels
     have been processed (Block_Size), emits Flush_Bytes worth of
     transactions in a single burst.
+
+    If progress_source is set, tracks only that specific task's pixel
+    progress instead of the entire pipeline group's aggregate.
     """
 
     def __init__(self, trigger_unit: str = "Block",
                  block_size: Optional[List[int]] = None,
                  flush_bytes: int = 256,
-                 pipeline_group: str = ""):
+                 pipeline_group: str = "",
+                 progress_source: Optional[str] = None):
         self.trigger_unit = trigger_unit
         self.block_pixels = (block_size[0] * block_size[1]) if block_size else 4096
         self.flush_bytes = flush_bytes
         self.pipeline_group = pipeline_group
+        self.progress_source = progress_source
         self.last_triggered_at = 0
 
     def step(self, agent: 'DmaAgent', tick: int,
              scoreboard: 'Scoreboard') -> List[AxiTransaction]:
-        # Monitor pipeline progress
-        progress = scoreboard.get_progress(self.pipeline_group)
+        # Monitor progress: specific producer task or entire pipeline group
+        if self.progress_source:
+            progress = scoreboard.get_task_progress(self.progress_source)
+        else:
+            progress = scoreboard.get_progress(self.pipeline_group)
+
         if progress - self.last_triggered_at < self.block_pixels:
             return []   # Silent — not enough pixels processed yet
 
@@ -120,7 +129,7 @@ class AccumulateAndFlushStrategy(BehaviorStrategy):
         while remaining > 0:
             tx = agent.next_transaction()
             if tx is None:
-                agent.finished = True
+                agent.tx_finished = True
                 break
             tx.tick = tick
             chunk = min(remaining, tx.bytes)

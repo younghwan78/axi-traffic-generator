@@ -2,6 +2,74 @@
 
 ---
 
+## 2026-03-05 (수)
+
+### 1. Accumulate_and_Flush Pixel Progress 수정
+
+**배경:** CAM_AE_Stat(64×64 블록 → 256B flush) BW plot이 막대 형태가 아닌 연속 선으로 표시됨.
+
+**근본 원인 3가지:**
+1. pipeline group 전체 pixel 합산 → flush 과다 발생 (2,864 vs 예상 2,025)
+2. SBWC 압축 시 `pixels = bytes / bpp` 과소 계산 → PPC 기반 매 tick 카운트로 수정
+3. tx pool 소진 시 pixel counting 중단 → `tx_finished` / `finished` 분리
+
+**변경 내용:**
+- `config_parser.py` — `BehaviorProfile.progress_source` 필드 추가
+- `behavior.py` — `AccumulateAndFlushStrategy`가 특정 producer task의 pixel만 추적, `tx_finished` 사용
+- `scheduler.py` — `Scoreboard`에 per-task pixel tracking, 매 tick PPC 기반 pixel counting, `total_frame_pixels` 기반 종료 판정, tx pool 크기 제한
+- `Scenario_4K.yaml` / `Scenario_4K_SMMU.yaml` — `Progress_Source: "ISP_Write_Y"`
+
+**검증 결과:**
+| 항목 | 수정 전 | 수정 후 | 기대값 |
+|------|---------|---------|--------|
+| Burst 횟수 | 2,864 | **2,025** | 2,025 ✓ |
+| 총 bytes | 733,184 | **518,400** | 518,400 ✓ |
+| Burst 간격 | ~325 ticks | **1,024 ticks** | 1,024 ✓ |
+
+---
+
+### 2. Line-Based Dependency Gating 수정
+
+**배경:** DISP_Read가 `Wait_For: ISP_Write_Y, Margin: 10`임에도 tick 10에서 바로 시작. dependency 게이트 미작동.
+
+**원인:** `_check_dependency`에서 `done >= (0 - 10) = -10` 조건이 항상 true.
+
+**변경 내용:**
+- `scheduler.py` — `DmaAgent`에 `_bytes_emitted`, `stride`, `_line_progress` 추가
+- `_check_dependency` — 실제 image line 기반: `producer._line_progress >= consumer._line_progress + margin`
+
+**결과:** DISP_RD_0 시작: tick 10 → **tick 6,409** (ISP_Write_Y가 ~20줄 쓴 후)
+
+---
+
+### 3. Frame Granularity Dependency 추가
+
+**배경:** Line 단위 dependency만 지원, Frame 단위(M2M 처리) 미지원.
+
+**변경 내용:**
+- `scheduler.py` — `_check_dependency`에 `Granularity: "Frame"` 분기 추가 (`producer.tx_finished` 기반)
+- `DMA_IP_Spec.yaml` — `M2M_RD_0` IP 스펙 추가
+- `Scenario_4K.yaml` — `M2M_Read` task 추가 (Frame dependency 예제)
+
+**결과:** M2M_Read 시작: tick **1,252,813** (ISP_Write_Y 마지막 tick 1,252,794 직후)
+
+---
+
+### 4. Traffic Verification 섹션 추가
+
+**배경:** trace_summary에서 실제 데이터량이 이론값과 일치하는지 확인하기 어려움.
+
+**변경 내용:**
+- `gen_summary.py` — **Traffic Verification** 섹션 추가
+  - 각 DMA별 기대 byte 산출식 (SBWC header/payload 분해, block count 등)
+  - 실제 vs 기대 비교 + PASS / FAIL / INCOMPLETE 판정
+  - Burst 패턴 분석 (avg/max burst, avg_gap)
+- `main.py` — `scenario` 객체를 `generate_summary`에 전달
+
+**수정 파일:** `gen_summary.py`, `main.py`
+
+---
+
 ## 2026-03-04 (화)
 
 ### 1. IP-DMA 계층 구조 + Instance Replication
